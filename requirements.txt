@@ -1,0 +1,7 @@
+# install openvino nightly (required for Gemma 4 support)
+--extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly
+
+openvino>=2026.2.0.0.dev
+numpy>=1.24,<2.5
+pillow>=10.0
+psutil>=5.9

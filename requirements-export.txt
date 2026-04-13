@@ -1,0 +1,8 @@
+# install openvino nightly + optimum-intel (required for model conversion)
+--extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly
+--extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release
+
+openvino>=2026.2.0.0.dev
+optimum-intel[openvino]>=2.1.0.dev0
+transformers>=4.50
+pillow>=10.0

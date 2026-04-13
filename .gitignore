@@ -1,0 +1,6 @@
+test_image.jpg
+__pycache__/
+*.pyc
+.venv/
+*.csv
+*.log

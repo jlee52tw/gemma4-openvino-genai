@@ -344,28 +344,50 @@ built from PR #3644 and prints the same performance metrics.
 ### Build
 
 Make sure you have already built openvino-genai from source (step 1.5).
-The CMake config files are located inside the venv's `site-packages`.
+
+The `pip install` build (step 1.5) produces CMake config files inside
+the source tree's build cache.  The OpenVINO runtime CMake config is in
+the venv's `site-packages`.
 
 ```powershell
-# Find the OpenVINOGenAI CMake config inside the venv
-$genaiDir = (python -c "import openvino_genai, os; print(os.path.dirname(openvino_genai.__file__))")
+# Paths — adjust if your directories differ
+$genaiCmakeDir = ".\openvino_genai_src\.py-build-cmake_cache\cp312-cp312-win_amd64"
+$ovCmakeDir    = ".\.venv\Lib\site-packages\openvino\cmake"
 
 cd cpp
-cmake -B build -DCMAKE_BUILD_TYPE=Release `
-    -DOpenVINOGenAI_DIR="$genaiDir" `
-    -DOpenVINO_DIR="$genaiDir/../openvino"
+cmake -B build `
+    -DOpenVINOGenAI_DIR="$genaiCmakeDir" `
+    -DOpenVINO_DIR="$ovCmakeDir"
 cmake --build build --config Release
 ```
 
 The executable is produced at `cpp\build\Release\run_gemma4.exe`.
 
-> **Note:** If CMake cannot find OpenVINO or OpenVINOGenAI, locate the
-> config files manually:
-> ```powershell
-> # List CMake config locations
-> python -c "import openvino_genai, os; print(os.path.dirname(openvino_genai.__file__))"
-> python -c "import openvino, os; print(os.path.join(os.path.dirname(openvino.__file__), 'cmake'))"
-> ```
+> **Tip:** The build-cache folder name (`cp312-cp312-win_amd64`) matches
+> your Python version and platform.  List the contents of
+> `openvino_genai_src\.py-build-cmake_cache\` if you are unsure.
+
+### Runtime DLL setup
+
+Before running the executable you must make the OpenVINO and GenAI
+shared libraries visible.  The simplest approach is to add the
+library directories to `PATH`:
+
+```powershell
+$env:PATH = @(
+    ".\.venv\Lib\site-packages\openvino_genai",
+    ".\.venv\Lib\site-packages\openvino\libs",
+    $env:PATH
+) -join ";"
+```
+
+Additionally, `openvino_genai.dll` expects `openvino_tokenizers.dll` to
+be in the **same directory**.  Copy it once after step 1.5:
+
+```powershell
+Copy-Item ".\.venv\Lib\site-packages\openvino_tokenizers\lib\openvino_tokenizers.dll" `
+          ".\.venv\Lib\site-packages\openvino_genai\openvino_tokenizers.dll" -Force
+```
 
 ### Run
 
@@ -389,11 +411,30 @@ The executable is produced at `cpp\build\Release\run_gemma4.exe`.
     --prompt-file prompt.txt
 ```
 
-> At runtime the executable needs `openvino_genai.dll`, `openvino.dll`,
-> and `openvino_tokenizers.dll` on `PATH`. These are located in the
-> venv's `Lib\site-packages\openvino\libs\` and
-> `Lib\site-packages\openvino_genai\`. Add them to `PATH` or copy
-> them next to the `.exe`.
+The output includes streaming text generation followed by a performance
+metrics summary:
+
+```
+------------------------------------------------------------
+  OpenVINO GenAI - Performance Metrics
+------------------------------------------------------------
+  Input tokens          : 13
+  Generated tokens      : 64
+
+  Load time             : 7569.00 ms
+  TTFT                  : 468.57 +/- 0.00 ms
+  TPOT                  : 28.18 +/- 15.21 ms
+  iPOT                  : 32.34 +/- 41.91 ms
+
+  Throughput            : 35.48 +/- 19.15 tok/s
+
+  Generate duration     : 2245.30 +/- 0.00 ms
+  Inference duration    : 2069.54 +/- 0.00 ms
+  Tokenization duration : 72.96 +/- 0.00 ms
+  Detokenization dur.   : 0.26 +/- 0.00 ms
+  Prepare embeddings    : 74.78 +/- 0.00 ms
+------------------------------------------------------------
+```
 
 ---
 

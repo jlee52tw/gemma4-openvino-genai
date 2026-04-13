@@ -4,7 +4,9 @@ Gemma 4 — Simple inference with OpenVINO GenAI VLMPipeline
 ===========================================================
 Demonstrates text-only and image+text inference using the
 openvino_genai.VLMPipeline API with Gemma 4 models exported
-to OpenVINO IR format.
+to OpenVINO IR format.  After generation, the built-in
+``PerfMetrics`` from openvino.genai are printed (TTFT, TPOT,
+throughput, etc.).
 
 Usage:
   # Text-only (default: GPU)
@@ -34,6 +36,48 @@ def load_image(path: str) -> ov.Tensor:
     arr = np.array(img)                     # (H, W, 3) uint8
     arr = np.expand_dims(arr, axis=0)       # (1, H, W, 3)
     return ov.Tensor(arr)
+
+
+def print_perf_metrics(metrics) -> None:
+    """Pretty-print the openvino_genai PerfMetrics returned by generate()."""
+
+    def fmt_ms(pair) -> str:
+        """Format a MeanStdPair (mean ± std) in milliseconds."""
+        return f"{pair.mean:.2f} ± {pair.std:.2f} ms"
+
+    def fmt_tok_s(pair) -> str:
+        """Format a MeanStdPair as tokens/s."""
+        return f"{pair.mean:.2f} ± {pair.std:.2f} tok/s"
+
+    sep = "-" * 60
+    print(sep)
+    print("  OpenVINO GenAI — Performance Metrics")
+    print(sep)
+
+    # Token counts
+    num_input  = metrics.get_num_input_tokens()
+    num_output = metrics.get_num_generated_tokens()
+    print(f"  Input tokens          : {num_input}")
+    print(f"  Generated tokens      : {num_output}")
+    print()
+
+    # Latency metrics
+    print(f"  Load time             : {metrics.get_load_time():.2f} ms")
+    print(f"  TTFT                  : {fmt_ms(metrics.get_ttft())}")
+    print(f"  TPOT                  : {fmt_ms(metrics.get_tpot())}")
+    print(f"  iPOT                  : {fmt_ms(metrics.get_ipot())}")
+    print()
+
+    # Throughput
+    print(f"  Throughput            : {fmt_tok_s(metrics.get_throughput())}")
+    print()
+
+    # Duration breakdown
+    print(f"  Generate duration     : {fmt_ms(metrics.get_generate_duration())}")
+    print(f"  Inference duration    : {fmt_ms(metrics.get_inference_duration())}")
+    print(f"  Tokenization duration : {fmt_ms(metrics.get_tokenization_duration())}")
+    print(f"  Detokenization dur.   : {fmt_ms(metrics.get_detokenization_duration())}")
+    print(sep)
 
 
 def main():
@@ -71,20 +115,15 @@ def main():
     print(f"Loading VLMPipeline from {model_dir} on {args.device}...")
     t0 = time.perf_counter()
     pipe = ov_genai.VLMPipeline(str(model_dir), args.device)
-    print(f"Model loaded in {time.perf_counter() - t0:.1f}s")
+    load_time = time.perf_counter() - t0
+    print(f"Model loaded in {load_time:.1f}s")
 
     # ── Generation config ───────────────────────────────────────────────────
     config = ov_genai.GenerationConfig()
     config.max_new_tokens = args.max_new_tokens
 
     # ── Streamer (print tokens as they arrive) ──────────────────────────────
-    first_token_time = None
-    gen_start = None
-
     def streamer(subword: str):
-        nonlocal first_token_time
-        if first_token_time is None:
-            first_token_time = time.perf_counter()
         print(subword, end="", flush=True)
         return False  # continue generating
 
@@ -98,28 +137,24 @@ def main():
     print(f"\nPrompt: {args.prompt}\n")
     print("Response: ", end="", flush=True)
 
-    gen_start = time.perf_counter()
-
     if image_tensor is not None:
-        output = pipe.generate(
+        result = pipe.generate(
             args.prompt,
             images=[image_tensor],
             generation_config=config,
             streamer=streamer,
         )
     else:
-        output = pipe.generate(
+        result = pipe.generate(
             args.prompt,
             generation_config=config,
             streamer=streamer,
         )
 
-    gen_end = time.perf_counter()
+    print("\n")
 
-    # ── Summary ─────────────────────────────────────────────────────────────
-    total_s = gen_end - gen_start
-    ttft_s = (first_token_time - gen_start) if first_token_time else -1
-    print(f"\n\n--- Generation completed in {total_s:.2f}s (TTFT: {ttft_s:.3f}s) ---")
+    # ── Performance metrics (from openvino.genai) ───────────────────────────
+    print_perf_metrics(result.perf_metrics)
 
 
 if __name__ == "__main__":

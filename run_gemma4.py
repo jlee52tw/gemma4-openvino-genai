@@ -40,43 +40,31 @@ def load_image(path: str) -> ov.Tensor:
 
 def print_perf_metrics(metrics) -> None:
     """Pretty-print the openvino_genai PerfMetrics returned by generate()."""
-
-    def fmt_ms(pair) -> str:
-        """Format a MeanStdPair (mean ± std) in milliseconds."""
-        return f"{pair.mean:.2f} ± {pair.std:.2f} ms"
-
-    def fmt_tok_s(pair) -> str:
-        """Format a MeanStdPair as tokens/s."""
-        return f"{pair.mean:.2f} ± {pair.std:.2f} tok/s"
-
     sep = "-" * 60
     print(sep)
     print("  OpenVINO GenAI — Performance Metrics")
     print(sep)
 
     # Token counts
-    num_input  = metrics.get_num_input_tokens()
-    num_output = metrics.get_num_generated_tokens()
-    print(f"  Input tokens          : {num_input}")
-    print(f"  Generated tokens      : {num_output}")
+    print(f"  Input tokens          : {metrics.get_num_input_tokens()}")
+    print(f"  Generated tokens      : {metrics.get_num_generated_tokens()}")
     print()
 
     # Latency metrics
     print(f"  Load time             : {metrics.get_load_time():.2f} ms")
-    print(f"  TTFT                  : {fmt_ms(metrics.get_ttft())}")
-    print(f"  TPOT                  : {fmt_ms(metrics.get_tpot())}")
-    print(f"  iPOT                  : {fmt_ms(metrics.get_ipot())}")
+    print(f"  TTFT                  : {metrics.get_ttft().mean:.2f} ms")
+    print(f"  TPOT                  : {metrics.get_tpot().mean:.2f} ms")
     print()
 
     # Throughput
-    print(f"  Throughput            : {fmt_tok_s(metrics.get_throughput())}")
+    print(f"  Throughput            : {metrics.get_throughput().mean:.2f} tok/s")
     print()
 
     # Duration breakdown
-    print(f"  Generate duration     : {fmt_ms(metrics.get_generate_duration())}")
-    print(f"  Inference duration    : {fmt_ms(metrics.get_inference_duration())}")
-    print(f"  Tokenization duration : {fmt_ms(metrics.get_tokenization_duration())}")
-    print(f"  Detokenization dur.   : {fmt_ms(metrics.get_detokenization_duration())}")
+    print(f"  Generate duration     : {metrics.get_generate_duration().mean:.2f} ms")
+    print(f"  Inference duration    : {metrics.get_inference_duration().mean:.2f} ms")
+    print(f"  Tokenization duration : {metrics.get_tokenization_duration().mean:.2f} ms")
+    print(f"  Detokenization dur.   : {metrics.get_detokenization_duration().mean:.2f} ms")
     print(sep)
 
 

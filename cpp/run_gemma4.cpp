@@ -112,20 +112,9 @@ static std::string read_text_file(const fs::path& path) {
 
 // ── Print performance metrics ──────────────────────────────────────────────
 
-static std::string fmt_ms(ov::genai::MeanStdPair p) {
-    std::ostringstream s;
-    s << std::fixed << std::setprecision(2) << p.mean << " +/- " << p.std << " ms";
-    return s.str();
-}
-
-static std::string fmt_tok_s(ov::genai::MeanStdPair p) {
-    std::ostringstream s;
-    s << std::fixed << std::setprecision(2) << p.mean << " +/- " << p.std << " tok/s";
-    return s.str();
-}
-
 static void print_perf_metrics(ov::genai::VLMPerfMetrics& metrics) {
     const std::string sep(60, '-');
+    std::cout << std::fixed << std::setprecision(2);
     std::cout << sep << "\n";
     std::cout << "  OpenVINO GenAI - Performance Metrics\n";
     std::cout << sep << "\n";
@@ -136,23 +125,21 @@ static void print_perf_metrics(ov::genai::VLMPerfMetrics& metrics) {
     std::cout << "\n";
 
     // Latency
-    std::cout << "  Load time             : " << std::fixed << std::setprecision(2)
-              << metrics.get_load_time() << " ms\n";
-    std::cout << "  TTFT                  : " << fmt_ms(metrics.get_ttft())  << "\n";
-    std::cout << "  TPOT                  : " << fmt_ms(metrics.get_tpot())  << "\n";
-    std::cout << "  iPOT                  : " << fmt_ms(metrics.get_ipot())  << "\n";
+    std::cout << "  Load time             : " << metrics.get_load_time() << " ms\n";
+    std::cout << "  TTFT                  : " << metrics.get_ttft().mean  << " ms\n";
+    std::cout << "  TPOT                  : " << metrics.get_tpot().mean  << " ms\n";
     std::cout << "\n";
 
     // Throughput
-    std::cout << "  Throughput            : " << fmt_tok_s(metrics.get_throughput()) << "\n";
+    std::cout << "  Throughput            : " << metrics.get_throughput().mean << " tok/s\n";
     std::cout << "\n";
 
     // Duration breakdown
-    std::cout << "  Generate duration     : " << fmt_ms(metrics.get_generate_duration())     << "\n";
-    std::cout << "  Inference duration    : " << fmt_ms(metrics.get_inference_duration())     << "\n";
-    std::cout << "  Tokenization duration : " << fmt_ms(metrics.get_tokenization_duration())  << "\n";
-    std::cout << "  Detokenization dur.   : " << fmt_ms(metrics.get_detokenization_duration())<< "\n";
-    std::cout << "  Prepare embeddings    : " << fmt_ms(metrics.get_prepare_embeddings_duration()) << "\n";
+    std::cout << "  Generate duration     : " << metrics.get_generate_duration().mean     << " ms\n";
+    std::cout << "  Inference duration    : " << metrics.get_inference_duration().mean     << " ms\n";
+    std::cout << "  Tokenization duration : " << metrics.get_tokenization_duration().mean  << " ms\n";
+    std::cout << "  Detokenization dur.   : " << metrics.get_detokenization_duration().mean << " ms\n";
+    std::cout << "  Prepare embeddings    : " << metrics.get_prepare_embeddings_duration().mean << " ms\n";
     std::cout << sep << "\n";
 }
 

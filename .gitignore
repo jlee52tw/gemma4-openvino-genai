@@ -4,3 +4,9 @@ __pycache__/
 .venv/
 *.csv
 *.log
+
+# C++ build artifacts
+cpp/build/
+*.exe
+*.obj
+*.pdb

@@ -13,6 +13,7 @@ models using the [`openvino.genai`](https://github.com/openvinotoolkit/openvino.
 |------|-------------|
 | `run_gemma4.py` | Simple inference script — text and image+text |
 | `benchmark.py` | Throughput / TTFT / memory benchmark |
+| `cpp/run_gemma4.cpp` | C++ inference — same features as `run_gemma4.py` |
 | `requirements.txt` | Runtime dependencies (inference only) |
 | `requirements-export.txt` | Dependencies for model conversion |
 
@@ -301,7 +302,7 @@ gemma-4-*-it-ov/
 
 ---
 
-## 3. Running Inference
+## 3. Running Inference (Python)
 
 ### Text-only
 
@@ -324,6 +325,75 @@ python run_gemma4.py `
 
 > **Note:** `--device GPU` targets the Intel integrated GPU (iGPU).
 > CPU is also supported (`--device CPU`) but significantly slower.
+
+---
+
+## 3.1 Running Inference (C++)
+
+A C++ version of `run_gemma4.py` is provided in the `cpp/` subfolder.
+It links against the `openvino::genai` shared library (`.dll` / `.so`)
+built from PR #3644 and prints the same performance metrics.
+
+| File | Description |
+|---|---|
+| `cpp/run_gemma4.cpp` | Main source — arg parsing, VLMPipeline, PerfMetrics |
+| `cpp/load_image.cpp` | Image loader using `stb_image.h` (downloaded by CMake) |
+| `cpp/load_image.hpp` | Header for image loader |
+| `cpp/CMakeLists.txt`  | CMake build script |
+
+### Build
+
+Make sure you have already built openvino-genai from source (step 1.5).
+The CMake config files are located inside the venv's `site-packages`.
+
+```powershell
+# Find the OpenVINOGenAI CMake config inside the venv
+$genaiDir = (python -c "import openvino_genai, os; print(os.path.dirname(openvino_genai.__file__))")
+
+cd cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release `
+    -DOpenVINOGenAI_DIR="$genaiDir" `
+    -DOpenVINO_DIR="$genaiDir/../openvino"
+cmake --build build --config Release
+```
+
+The executable is produced at `cpp\build\Release\run_gemma4.exe`.
+
+> **Note:** If CMake cannot find OpenVINO or OpenVINOGenAI, locate the
+> config files manually:
+> ```powershell
+> # List CMake config locations
+> python -c "import openvino_genai, os; print(os.path.dirname(openvino_genai.__file__))"
+> python -c "import openvino, os; print(os.path.join(os.path.dirname(openvino.__file__), 'cmake'))"
+> ```
+
+### Run
+
+```powershell
+# Text-only
+.\cpp\build\Release\run_gemma4.exe `
+    --model-dir .\gemma-4-E2B-it-ov `
+    --device GPU `
+    --prompt "Explain quantum computing in simple terms."
+
+# Image + text
+.\cpp\build\Release\run_gemma4.exe `
+    --model-dir .\gemma-4-E2B-it-ov `
+    --device GPU `
+    --prompt "Describe this image." `
+    --image photo.jpg
+
+# Prompt from file
+.\cpp\build\Release\run_gemma4.exe `
+    --model-dir .\gemma-4-E2B-it-ov `
+    --prompt-file prompt.txt
+```
+
+> At runtime the executable needs `openvino_genai.dll`, `openvino.dll`,
+> and `openvino_tokenizers.dll` on `PATH`. These are located in the
+> venv's `Lib\site-packages\openvino\libs\` and
+> `Lib\site-packages\openvino_genai\`. Add them to `PATH` or copy
+> them next to the `.exe`.
 
 ---
 

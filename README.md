@@ -53,33 +53,32 @@ The setup flow is:
 
 ### 1.1 Clone this repository
 
-```bash
+```powershell
 git clone https://github.com/jlee52tw/gemma4-openvino-genai.git
 cd gemma4-openvino-genai
 ```
 
 ### 1.2 Create a Python virtual environment
 
-```bash
+```powershell
 python -m venv .venv
 ```
 
-Activate it:
+Activate it (PowerShell):
 
-```bash
-# Linux / macOS
-source .venv/bin/activate
-
-# Windows (PowerShell)
+```powershell
 .venv\Scripts\Activate.ps1
+```
 
-# Windows (cmd)
+Or from `cmd`:
+
+```cmd
 .venv\Scripts\activate.bat
 ```
 
 Upgrade pip:
 
-```bash
+```powershell
 python -m pip install --upgrade pip
 ```
 
@@ -91,14 +90,14 @@ The `requirements.txt` installs the **OpenVINO 2026.2.0.dev nightly** runtime
 > **Important:** This step installs the OpenVINO *runtime* — **not**
 > `openvino-genai`. The GenAI package is built from source in the next steps.
 
-```bash
-pip install -r requirements.txt \
+```powershell
+pip install -r requirements.txt `
     --trusted-host storage.openvinotoolkit.org
 ```
 
 Verify OpenVINO is installed:
 
-```bash
+```powershell
 python -c "import openvino; print('OpenVINO', openvino.__version__)"
 # Expected output: OpenVINO 2026.2.0.dev...
 ```
@@ -107,8 +106,8 @@ python -c "import openvino; print('OpenVINO', openvino.__version__)"
 
 Clone the branch that contains Gemma 4 VLMPipeline support:
 
-```bash
-git clone --recursive --branch as/vlm_enable_1 \
+```powershell
+git clone --recursive --branch as/vlm_enable_1 `
     https://github.com/as-suvorov/openvino.genai.git openvino_genai_src
 ```
 
@@ -123,17 +122,18 @@ A C++ compiler and CMake are required to build the native code.
 
 | Requirement | Details |
 |---|---|
-| **C++ compiler** | MSVC 2022 (Windows) / GCC 11+ (Linux) / Clang 14+ (macOS) |
-| **CMake** | ≥ 3.23 |
+| **Visual Studio 2022** | [Community edition](https://visualstudio.microsoft.com/) with the **"Desktop development with C++"** workload (includes MSVC & CMake) |
+| **CMake** | ≥ 3.23 (bundled with VS 2022) |
 | **Python** | 3.10 – 3.12 |
 | **OpenVINO** | ≥ 2026.2.0.dev nightly (installed in step 1.3) |
 
-**Windows users:** Install
-[Visual Studio 2022 Community](https://visualstudio.microsoft.com/) with the
-**"Desktop development with C++"** workload. This includes MSVC, CMake, and
-the Windows SDK. Make sure to run the build from a terminal that has the
-VS environment loaded (e.g. "Developer PowerShell for VS 2022", or activate
-with `vcvarsall.bat`).
+Make sure to run the build from a terminal that has the VS environment
+loaded — e.g. **"Developer PowerShell for VS 2022"**, or activate
+manually with:
+
+```powershell
+& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1"
+```
 
 #### Build command
 
@@ -141,10 +141,10 @@ with `vcvarsall.bat`).
 bindings, and tokenizer libraries. This typically takes **5–15 minutes**
 depending on your machine.
 
-```bash
-pip install ./openvino_genai_src \
-    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly \
-    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release \
+```powershell
+pip install ./openvino_genai_src `
+    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly `
+    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release `
     --trusted-host storage.openvinotoolkit.org
 ```
 
@@ -158,15 +158,7 @@ The build installs **two** packages:
 > **Tip:** Append `-v` and log the output for easier debugging when the
 > build fails:
 >
-> ```bash
-> # Linux / macOS
-> pip install ./openvino_genai_src \
->     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly \
->     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release \
->     --trusted-host storage.openvinotoolkit.org \
->     -v 2>&1 | tee build.log
->
-> # Windows (PowerShell)
+> ```powershell
 > pip install ./openvino_genai_src `
 >     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly `
 >     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release `
@@ -176,24 +168,21 @@ The build installs **two** packages:
 
 #### Rebuilding after a source update
 
-```bash
+```powershell
 cd openvino_genai_src
 git pull --recurse-submodules
 cd ..
 
-pip install ./openvino_genai_src --no-build-isolation --force-reinstall \
-    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly \
-    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release \
+pip install ./openvino_genai_src --no-build-isolation --force-reinstall `
+    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly `
+    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release `
     --trusted-host storage.openvinotoolkit.org
 ```
 
 > If the rebuild fails due to stale CMake cache, delete the build
 > directory and retry:
-> ```bash
-> # Linux / macOS
-> rm -rf openvino_genai_src/.py-build-cmake_cache
-> # Windows
-> rmdir /s /q openvino_genai_src\.py-build-cmake_cache
+> ```powershell
+> Remove-Item -Recurse -Force openvino_genai_src\.py-build-cmake_cache
 > ```
 
 ### 1.6 Verify the complete environment
@@ -201,7 +190,7 @@ pip install ./openvino_genai_src --no-build-isolation --force-reinstall \
 Run the following script to confirm that all required packages are
 installed and Gemma 4 VLMPipeline support is available:
 
-```bash
+```powershell
 python -c "
 import openvino as ov
 import openvino_genai as genai
@@ -245,7 +234,7 @@ inference with pre-converted models.
 
 ### 2.1 Install export dependencies
 
-```bash
+```powershell
 pip install -r requirements-export.txt
 ```
 
@@ -255,37 +244,37 @@ Use [`optimum-cli`](https://huggingface.co/docs/optimum/intel/inference) to
 convert the HuggingFace model to OpenVINO IR format with INT4 weight
 compression:
 
-```bash
+```powershell
 # Gemma 4 E2B (smallest — good for quick testing)
-optimum-cli export openvino \
-    --model google/gemma-4-E2B-it \
-    --weight-format int4 \
-    --group-size 64 \
-    --ratio 1.0 \
+optimum-cli export openvino `
+    --model google/gemma-4-E2B-it `
+    --weight-format int4 `
+    --group-size 64 `
+    --ratio 1.0 `
     gemma-4-E2B-it-ov
 
 # Gemma 4 E4B
-optimum-cli export openvino \
-    --model google/gemma-4-E4B-it \
-    --weight-format int4 \
-    --group-size 64 \
-    --ratio 1.0 \
+optimum-cli export openvino `
+    --model google/gemma-4-E4B-it `
+    --weight-format int4 `
+    --group-size 64 `
+    --ratio 1.0 `
     gemma-4-E4B-it-ov
 
 # Gemma 4 26B-A4B (MoE — routes excluded from quantization)
-optimum-cli export openvino \
-    --model google/gemma-4-26B-A4B-it \
-    --weight-format int4 \
-    --group-size 64 \
-    --ratio 1.0 \
+optimum-cli export openvino `
+    --model google/gemma-4-26B-A4B-it `
+    --weight-format int4 `
+    --group-size 64 `
+    --ratio 1.0 `
     gemma-4-26B-A4B-it-ov
 
 # Gemma 4 31B (largest dense)
-optimum-cli export openvino \
-    --model google/gemma-4-31B-it \
-    --weight-format int4 \
-    --group-size 64 \
-    --ratio 1.0 \
+optimum-cli export openvino `
+    --model google/gemma-4-31B-it `
+    --weight-format int4 `
+    --group-size 64 `
+    --ratio 1.0 `
     gemma-4-31B-it-ov
 ```
 
@@ -316,20 +305,20 @@ gemma-4-*-it-ov/
 
 ### Text-only
 
-```bash
-python run_gemma4.py \
-    --model-dir ./gemma-4-E2B-it-ov \
-    --device GPU \
+```powershell
+python run_gemma4.py `
+    --model-dir ./gemma-4-E2B-it-ov `
+    --device GPU `
     --prompt "Explain quantum computing in simple terms."
 ```
 
 ### Image + Text
 
-```bash
-python run_gemma4.py \
-    --model-dir ./gemma-4-E2B-it-ov \
-    --device GPU \
-    --prompt "Describe this image in detail." \
+```powershell
+python run_gemma4.py `
+    --model-dir ./gemma-4-E2B-it-ov `
+    --device GPU `
+    --prompt "Describe this image in detail." `
     --image photo.jpg
 ```
 
@@ -340,23 +329,23 @@ python run_gemma4.py \
 
 ## 4. Running the Benchmark
 
-```bash
+```powershell
 # Single model — quick test
-python benchmark.py \
-    --model-dir ./gemma-4-E2B-it-ov \
-    --device GPU \
-    --max-new-tokens 128 \
+python benchmark.py `
+    --model-dir ./gemma-4-E2B-it-ov `
+    --device GPU `
+    --max-new-tokens 128 `
     --warmup 1 --runs 3
 
 # Multiple models — full sweep
-python benchmark.py \
-    --model-dir ./gemma-4-E2B-it-ov \
-                ./gemma-4-E4B-it-ov \
-                ./gemma-4-26B-A4B-it-ov \
-                ./gemma-4-31B-it-ov \
-    --device GPU \
-    --max-new-tokens 128 \
-    --warmup 1 --runs 3 \
+python benchmark.py `
+    --model-dir ./gemma-4-E2B-it-ov `
+                ./gemma-4-E4B-it-ov `
+                ./gemma-4-26B-A4B-it-ov `
+                ./gemma-4-31B-it-ov `
+    --device GPU `
+    --max-new-tokens 128 `
+    --warmup 1 --runs 3 `
     --output-csv results.csv
 ```
 

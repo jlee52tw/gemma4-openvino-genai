@@ -94,7 +94,11 @@ def main():
     )
     parser.add_argument(
         "--prompt", default="Explain quantum computing in simple terms.",
-        help="Text prompt",
+        help="Text prompt (ignored if --prompt-file is given)",
+    )
+    parser.add_argument(
+        "--prompt-file", default=None,
+        help="Path to a text file whose contents are used as the prompt",
     )
     parser.add_argument(
         "--image", default=None,
@@ -110,6 +114,16 @@ def main():
     if not model_dir.exists():
         print(f"Error: model directory not found: {model_dir}")
         sys.exit(1)
+
+    # ── Resolve prompt ────────────────────────────────────────────────────
+    if args.prompt_file:
+        pf = Path(args.prompt_file)
+        if not pf.exists():
+            print(f"Error: prompt file not found: {pf}")
+            sys.exit(1)
+        prompt = pf.read_text(encoding="utf-8").strip()
+    else:
+        prompt = args.prompt
 
     # ── Load model ──────────────────────────────────────────────────────────
     print(f"Loading VLMPipeline from {model_dir} on {args.device}...")
@@ -134,19 +148,19 @@ def main():
         print(f"Image loaded: {args.image}")
 
     # ── Generate ────────────────────────────────────────────────────────────
-    print(f"\nPrompt: {args.prompt}\n")
+    print(f"\nPrompt: {prompt}\n")
     print("Response: ", end="", flush=True)
 
     if image_tensor is not None:
         result = pipe.generate(
-            args.prompt,
+            prompt,
             images=[image_tensor],
             generation_config=config,
             streamer=streamer,
         )
     else:
         result = pipe.generate(
-            args.prompt,
+            prompt,
             generation_config=config,
             streamer=streamer,
         )

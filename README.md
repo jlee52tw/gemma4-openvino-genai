@@ -170,14 +170,8 @@ python run_gemma4.py \
     --image photo.jpg
 ```
 
-### On CPU
-
-```bash
-python run_gemma4.py \
-    --model-dir ./gemma-4-E2B-it-ov \
-    --device CPU \
-    --prompt "Hello, what can you do?"
-```
+> **Note:** `--device GPU` targets the Intel integrated GPU (iGPU).
+> CPU is also supported (`--device CPU`) but significantly slower.
 
 ---
 

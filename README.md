@@ -34,6 +34,23 @@ All models support **text**, **image+text**, **audio+text**, and
 
 ## 1. Environment Setup
 
+Gemma 4 VLMPipeline support is provided by
+[PR #3644](https://github.com/openvinotoolkit/openvino.genai/pull/3644),
+which has **not yet been merged** into the main openvino.genai package.
+This means `openvino-genai` from PyPI **does not** include Gemma 4 support —
+you must **build from source**.
+
+The setup flow is:
+
+```
+1.1  Clone this repo
+1.2  Create Python virtual environment
+1.3  Install OpenVINO nightly runtime + Python dependencies
+1.4  Clone openvino.genai PR #3644 source
+1.5  Build & install openvino-genai from source (C++ compilation)
+1.6  Verify the complete environment
+```
+
 ### 1.1 Clone this repository
 
 ```bash
@@ -45,81 +62,132 @@ cd gemma4-openvino-genai
 
 ```bash
 python -m venv .venv
-# Linux / macOS
-source .venv/bin/activate
-# Windows
-.venv\Scripts\activate
 ```
 
-### 1.3 Install runtime dependencies
+Activate it:
 
 ```bash
-pip install -r requirements.txt
+# Linux / macOS
+source .venv/bin/activate
+
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+
+# Windows (cmd)
+.venv\Scripts\activate.bat
 ```
 
-### 1.4 Build & install openvino-genai from source (PR #3644)
+Upgrade pip:
 
-Gemma 4 VLMPipeline support is provided by
-[PR #3644](https://github.com/openvinotoolkit/openvino.genai/pull/3644).
-Until it is merged, you need to build from source.
+```bash
+python -m pip install --upgrade pip
+```
 
-#### Prerequisites
+### 1.3 Install OpenVINO nightly runtime & Python dependencies
 
-| Requirement | Details |
-|---|---|
-| **C++ compiler** | MSVC 2022 (Windows) / GCC 11+ (Linux) / Clang 14+ (macOS) |
-| **CMake** | ≥ 3.23 |
-| **Python** | 3.10 – 3.12 |
-| **OpenVINO** | ≥ 2026.2.0.dev nightly (installed via `requirements.txt`) |
+The `requirements.txt` installs the **OpenVINO 2026.2.0.dev nightly** runtime
+(required for Gemma 4), plus `numpy`, `pillow`, and `psutil`.
 
-On **Windows**, install
-[Visual Studio 2022](https://visualstudio.microsoft.com/) with the
-"Desktop development with C++" workload (includes MSVC and CMake).
+> **Important:** This step installs the OpenVINO *runtime* — **not**
+> `openvino-genai`. The GenAI package is built from source in the next steps.
 
-#### Clone the source
+```bash
+pip install -r requirements.txt \
+    --trusted-host storage.openvinotoolkit.org
+```
+
+Verify OpenVINO is installed:
+
+```bash
+python -c "import openvino; print('OpenVINO', openvino.__version__)"
+# Expected output: OpenVINO 2026.2.0.dev...
+```
+
+### 1.4 Clone the openvino.genai source (PR #3644)
+
+Clone the branch that contains Gemma 4 VLMPipeline support:
 
 ```bash
 git clone --recursive --branch as/vlm_enable_1 \
     https://github.com/as-suvorov/openvino.genai.git openvino_genai_src
 ```
 
-#### Build & install
+This creates an `openvino_genai_src/` directory with the C++ source code
+and all submodules (including `openvino_tokenizers`).
 
-The `pip install .` command runs CMake under the hood to compile the C++
-core and Python bindings. This typically takes 5–15 minutes depending on
-your machine.
+### 1.5 Build & install openvino-genai from source
+
+#### Prerequisites
+
+A C++ compiler and CMake are required to build the native code.
+
+| Requirement | Details |
+|---|---|
+| **C++ compiler** | MSVC 2022 (Windows) / GCC 11+ (Linux) / Clang 14+ (macOS) |
+| **CMake** | ≥ 3.23 |
+| **Python** | 3.10 – 3.12 |
+| **OpenVINO** | ≥ 2026.2.0.dev nightly (installed in step 1.3) |
+
+**Windows users:** Install
+[Visual Studio 2022 Community](https://visualstudio.microsoft.com/) with the
+**"Desktop development with C++"** workload. This includes MSVC, CMake, and
+the Windows SDK. Make sure to run the build from a terminal that has the
+VS environment loaded (e.g. "Developer PowerShell for VS 2022", or activate
+with `vcvarsall.bat`).
+
+#### Build command
+
+`pip install .` runs CMake under the hood to compile the C++ core, Python
+bindings, and tokenizer libraries. This typically takes **5–15 minutes**
+depending on your machine.
 
 ```bash
 pip install ./openvino_genai_src \
     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly \
-    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release
+    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release \
+    --trusted-host storage.openvinotoolkit.org
 ```
 
-> **Tip:** Append `-v` for verbose build output (useful for diagnosing
-> compiler errors):
+The build installs **two** packages:
+
+| Package | Description |
+|---|---|
+| `openvino-genai` | GenAI pipeline APIs (LLMPipeline, VLMPipeline, etc.) |
+| `openvino-tokenizers` | Tokenizer / detokenizer support |
+
+> **Tip:** Append `-v` and log the output for easier debugging when the
+> build fails:
+>
 > ```bash
+> # Linux / macOS
 > pip install ./openvino_genai_src \
 >     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly \
 >     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release \
+>     --trusted-host storage.openvinotoolkit.org \
 >     -v 2>&1 | tee build.log
+>
+> # Windows (PowerShell)
+> pip install ./openvino_genai_src `
+>     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly `
+>     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release `
+>     --trusted-host storage.openvinotoolkit.org `
+>     -v 2>&1 | Tee-Object -FilePath build.log
 > ```
 
 #### Rebuilding after a source update
-
-If you need to pull the latest changes and rebuild:
 
 ```bash
 cd openvino_genai_src
 git pull --recurse-submodules
 cd ..
 
-# Clean the previous build cache, then reinstall
 pip install ./openvino_genai_src --no-build-isolation --force-reinstall \
     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly \
-    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release
+    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release \
+    --trusted-host storage.openvinotoolkit.org
 ```
 
-> If the rebuild fails due to stale CMake cache, remove the build
+> If the rebuild fails due to stale CMake cache, delete the build
 > directory and retry:
 > ```bash
 > # Linux / macOS
@@ -128,13 +196,48 @@ pip install ./openvino_genai_src --no-build-isolation --force-reinstall \
 > rmdir /s /q openvino_genai_src\.py-build-cmake_cache
 > ```
 
-#### Verify installation
+### 1.6 Verify the complete environment
 
-```python
-import openvino_genai
-print(openvino_genai.__version__)            # should contain "as/vlm_enable_1"
-print(hasattr(openvino_genai, "VLMPipeline"))  # True
+Run the following script to confirm that all required packages are
+installed and Gemma 4 VLMPipeline support is available:
+
+```bash
+python -c "
+import openvino as ov
+import openvino_genai as genai
+import numpy, PIL, psutil
+
+print('OpenVINO          :', ov.__version__)
+print('openvino-genai    :', genai.__version__)
+print('numpy             :', numpy.__version__)
+print('Pillow            :', PIL.__version__)
+print('psutil            :', psutil.__version__)
+print()
+print('VLMPipeline available :', hasattr(genai, 'VLMPipeline'))
+print('Available devices     :', ov.Core().available_devices)
+"
 ```
+
+Expected output (versions may differ):
+
+```
+OpenVINO          : 2026.2.0.dev20250411
+openvino-genai    : 2026.2.0.0
+numpy             : 2.4.4
+Pillow            : 12.2.0
+psutil            : 7.2.2
+
+VLMPipeline available : True
+Available devices     : ['CPU', 'GPU']
+```
+
+> If `GPU` does not appear in the device list, ensure the
+> [Intel GPU driver](https://www.intel.com/content/www/us/en/download/726609/intel-arc-iris-xe-graphics-whql-windows.html)
+> is installed.
+
+Once the verification passes, your environment is ready.
+Proceed to **Section 2** to convert models, or **Section 3** to run
+inference with pre-converted models.
 
 ---
 

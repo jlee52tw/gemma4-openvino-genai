@@ -54,21 +54,74 @@ pip install -r requirements.txt
 
 Gemma 4 VLMPipeline support is provided by
 [PR #3644](https://github.com/openvinotoolkit/openvino.genai/pull/3644).
-Until it is merged, you need to build from source:
+Until it is merged, you need to build from source.
+
+#### Prerequisites
+
+| Requirement | Details |
+|---|---|
+| **C++ compiler** | MSVC 2022 (Windows) / GCC 11+ (Linux) / Clang 14+ (macOS) |
+| **CMake** | ≥ 3.23 |
+| **Python** | 3.10 – 3.12 |
+| **OpenVINO** | ≥ 2026.2.0.dev nightly (installed via `requirements.txt`) |
+
+On **Windows**, install
+[Visual Studio 2022](https://visualstudio.microsoft.com/) with the
+"Desktop development with C++" workload (includes MSVC and CMake).
+
+#### Clone the source
 
 ```bash
 git clone --recursive --branch as/vlm_enable_1 \
     https://github.com/as-suvorov/openvino.genai.git openvino_genai_src
+```
 
+#### Build & install
+
+The `pip install .` command runs CMake under the hood to compile the C++
+core and Python bindings. This typically takes 5–15 minutes depending on
+your machine.
+
+```bash
 pip install ./openvino_genai_src \
     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly \
     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release
 ```
 
-> **Build requirements:** C++ compiler (MSVC 2022 / GCC 11+ / Clang 14+)
-> and CMake ≥ 3.23.
+> **Tip:** Append `-v` for verbose build output (useful for diagnosing
+> compiler errors):
+> ```bash
+> pip install ./openvino_genai_src \
+>     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly \
+>     --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release \
+>     -v 2>&1 | tee build.log
+> ```
 
-After installation, verify:
+#### Rebuilding after a source update
+
+If you need to pull the latest changes and rebuild:
+
+```bash
+cd openvino_genai_src
+git pull --recurse-submodules
+cd ..
+
+# Clean the previous build cache, then reinstall
+pip install ./openvino_genai_src --no-build-isolation --force-reinstall \
+    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly \
+    --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/pre-release
+```
+
+> If the rebuild fails due to stale CMake cache, remove the build
+> directory and retry:
+> ```bash
+> # Linux / macOS
+> rm -rf openvino_genai_src/.py-build-cmake_cache
+> # Windows
+> rmdir /s /q openvino_genai_src\.py-build-cmake_cache
+> ```
+
+#### Verify installation
 
 ```python
 import openvino_genai

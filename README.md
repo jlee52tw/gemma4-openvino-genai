@@ -14,6 +14,7 @@ models using the [`openvino.genai`](https://github.com/openvinotoolkit/openvino.
 | `run_gemma4.py` | Simple inference script — text and image+text |
 | `benchmark.py` | Throughput / TTFT / memory benchmark |
 | `cpp/run_gemma4.cpp` | C++ inference — same features as `run_gemma4.py` |
+| `create_release.ps1` | Builds a self-contained runtime folder with `setupvars` |
 | `requirements.txt` | Runtime dependencies (inference only) |
 | `requirements-export.txt` | Dependencies for model conversion |
 
@@ -331,7 +332,7 @@ python run_gemma4.py `
 ## 3.1 Running Inference (C++)
 
 A C++ version of `run_gemma4.py` is provided in the `cpp/` subfolder.
-It links against the `openvino::genai` shared library (`.dll` / `.so`)
+It links against the `openvino::genai` shared library (`.dll`)
 built from PR #3644 and prints the same performance metrics.
 
 | File | Description |
@@ -341,57 +342,61 @@ built from PR #3644 and prints the same performance metrics.
 | `cpp/load_image.hpp` | Header for image loader |
 | `cpp/CMakeLists.txt`  | CMake build script |
 
-### Build
+### 3.1.1 Create a release folder (one-time setup)
 
-Make sure you have already built openvino-genai from source (step 1.5).
-
-The `pip install` build (step 1.5) produces CMake config files inside
-the source tree's build cache.  The OpenVINO runtime CMake config is in
-the venv's `site-packages`.
+After building openvino-genai from source (step 1.5), run
+`create_release.ps1` to assemble a self-contained **release folder**
+with all DLLs, headers, CMake configs, and `setupvars` scripts:
 
 ```powershell
-# Paths — adjust if your directories differ
-$genaiCmakeDir = ".\openvino_genai_src\.py-build-cmake_cache\cp312-cp312-win_amd64"
-$ovCmakeDir    = ".\.venv\Lib\site-packages\openvino\cmake"
+.\create_release.ps1 `
+    -GenaiSrc  .\openvino_genai_src `
+    -VenvDir   .\.venv `
+    -InstallDir .\openvino_genai_release
+```
+
+This produces:
+
+```
+openvino_genai_release/
+├── setupvars.ps1           # <-- source this before building / running
+├── setupvars.bat           #     (cmd.exe version)
+├── runtime/
+│   ├── bin/intel64/Release/   openvino_genai.dll + openvino_tokenizers.dll
+│   ├── lib/intel64/Release/   openvino_genai.lib
+│   ├── include/               GenAI C++ headers
+│   └── cmake/                 CMake configs (OpenVINO + GenAI)
+└── openvino/
+    ├── libs/                  OpenVINO core DLLs + .lib files
+    └── include/               OpenVINO core C++ headers
+```
+
+### 3.1.2 Build the C++ sample
+
+```powershell
+# Initialize the environment (adds DLL dirs to PATH, sets CMake vars)
+. .\openvino_genai_release\setupvars.ps1
 
 cd cpp
-cmake -B build `
-    -DOpenVINOGenAI_DIR="$genaiCmakeDir" `
-    -DOpenVINO_DIR="$ovCmakeDir"
+cmake -B build
 cmake --build build --config Release
 ```
 
 The executable is produced at `cpp\build\Release\run_gemma4.exe`.
 
-> **Tip:** The build-cache folder name (`cp312-cp312-win_amd64`) matches
-> your Python version and platform.  List the contents of
-> `openvino_genai_src\.py-build-cmake_cache\` if you are unsure.
+> **Note:** After sourcing `setupvars.ps1`, the environment variables
+> `OpenVINO_DIR` and `OpenVINOGenAI_DIR` are set automatically — you
+> do **not** need to pass `-DOpenVINO_DIR=...` manually.
 
-### Runtime DLL setup
+### 3.1.3 Run
 
-Before running the executable you must make the OpenVINO and GenAI
-shared libraries visible.  The simplest approach is to add the
-library directories to `PATH`:
-
-```powershell
-$env:PATH = @(
-    ".\.venv\Lib\site-packages\openvino_genai",
-    ".\.venv\Lib\site-packages\openvino\libs",
-    $env:PATH
-) -join ";"
-```
-
-Additionally, `openvino_genai.dll` expects `openvino_tokenizers.dll` to
-be in the **same directory**.  Copy it once after step 1.5:
+Always source `setupvars.ps1` in every new terminal session before
+running the executable:
 
 ```powershell
-Copy-Item ".\.venv\Lib\site-packages\openvino_tokenizers\lib\openvino_tokenizers.dll" `
-          ".\.venv\Lib\site-packages\openvino_genai\openvino_tokenizers.dll" -Force
-```
+# Initialize DLL paths (once per terminal)
+. .\openvino_genai_release\setupvars.ps1
 
-### Run
-
-```powershell
 # Text-only
 .\cpp\build\Release\run_gemma4.exe `
     --model-dir .\gemma-4-E2B-it-ov `

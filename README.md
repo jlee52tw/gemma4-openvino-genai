@@ -34,7 +34,14 @@ All models support **text**, **image+text**, **audio+text**, and
 
 ## 1. Environment Setup
 
-### 1.1 Create a Python virtual environment
+### 1.1 Clone this repository
+
+```bash
+git clone https://github.com/jlee52tw/gemma4-openvino-genai.git
+cd gemma4-openvino-genai
+```
+
+### 1.2 Create a Python virtual environment
 
 ```bash
 python -m venv .venv
@@ -44,13 +51,13 @@ source .venv/bin/activate
 .venv\Scripts\activate
 ```
 
-### 1.2 Install runtime dependencies
+### 1.3 Install runtime dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 1.3 Build & install openvino-genai from source (PR #3644)
+### 1.4 Build & install openvino-genai from source (PR #3644)
 
 Gemma 4 VLMPipeline support is provided by
 [PR #3644](https://github.com/openvinotoolkit/openvino.genai/pull/3644).

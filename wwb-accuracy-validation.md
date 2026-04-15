@@ -12,7 +12,7 @@ from the `openvino.genai` repository.
 1. [Overview](#overview)
 2. [Prerequisites](#prerequisites)
 3. [Methodology](#methodology)
-4. [Scripts](#scripts)
+4. [Script](#script)
 5. [How to Run](#how-to-run)
 6. [Results](#results)
 7. [Interpreting Metrics](#interpreting-metrics)
@@ -106,14 +106,7 @@ huggingface-cli download google/gemma-4-E4B-it --local-dir ./gemma-4-E4B-it-hf
 
 ---
 
-## Scripts
-
-This project includes two WWB scripts:
-
-### `run_wwb_gemma4.py` — Custom Prompts (16 diverse topics)
-
-Uses 16 handcrafted prompts covering science, coding, literature, economics,
-biology, and technology.  Good for quick validation.
+## Script
 
 ### `run_wwb_builtin.py` — Official WWB Built-in Prompts (27 who/what)
 
@@ -125,16 +118,14 @@ This is the **standard evaluation** used across all openvino.genai model validat
 
 ## How to Run
 
-### Option A: Built-in 27 Prompts (Recommended)
-
 ```powershell
 # Activate the venv with openvino-genai + whowhatbench
 .\__envs_genai\Scripts\Activate.ps1
 
-# Step 1 — Generate ground truth (CPU, slow: ~60 min for 27 prompts)
+# Step 1 — Generate ground truth (CPU, slow: ~15 min for 27 prompts)
 python run_wwb_builtin.py --step gt --hf-model ./gemma-4-E4B-it-hf
 
-# Step 2 — Generate target answers (GPU, fast: ~5 min for 27 prompts)
+# Step 2 — Generate target answers (GPU, fast: ~3 min for 27 prompts)
 python run_wwb_builtin.py --step target --ov-model ./gemma-4-E4B-it-ov
 
 # Step 3 — Compute metrics
@@ -154,14 +145,6 @@ python run_wwb_builtin.py --step score --hf-model ./gemma-4-E4B-it-hf
 | `--num-samples` | all 27 | Limit number of prompts |
 | `--device` | GPU | Device for OV inference |
 
-### Option B: Custom 16 Prompts (Quick Check)
-
-```powershell
-python run_wwb_gemma4.py --step gt     --hf-model ./gemma-4-E4B-it-hf --ov-model ./gemma-4-E4B-it-ov
-python run_wwb_gemma4.py --step target --hf-model ./gemma-4-E4B-it-hf --ov-model ./gemma-4-E4B-it-ov
-python run_wwb_gemma4.py --step score  --hf-model ./gemma-4-E4B-it-hf --ov-model ./gemma-4-E4B-it-ov
-```
-
 ---
 
 ## Results
@@ -171,43 +154,14 @@ python run_wwb_gemma4.py --step score  --hf-model ./gemma-4-E4B-it-hf --ov-model
 | Item | Value |
 |------|-------|
 | Platform | Intel Panther Lake (12 Xe EUs) |
-| RAM | 102.5 GB |
+| RAM | 96 GB |
 | Original model | `google/gemma-4-E4B-it` (8B params, BF16) |
 | Quantized model | `gemma-4-E4B-it-ov` (INT4, group_size=64, asymmetric, ratio=1.0) |
 | GT device | CPU (FP32) |
 | Target device | GPU (INT4) |
 | Scoring model | `sentence-transformers/all-mpnet-base-v2` |
 
-### Custom 16 Prompts — `run_wwb_gemma4.py` (8 samples, max_new_tokens=512)
-
-| Metric | Value |
-|--------|-------|
-| **Similarity** | **0.9191** |
-| FDT | 5.6 |
-| FDT norm | 0.0142 |
-| SDT | 444.9 |
-| SDT norm | 0.9646 |
-
-Per-prompt similarity breakdown:
-
-| # | Prompt | Similarity |
-|---|--------|-----------|
-| 1 | Explain quantum computing in simple terms | 0.8506 |
-| 2 | Differences between Python and JavaScript | 0.9438 |
-| 3 | Write a short poem about the ocean | 0.8693 |
-| 4 | Describe the process of photosynthesis | 0.9266 |
-| 5 | Benefits of regular exercise | 0.9421 |
-| 6 | Explain how a neural network works | 0.9418 |
-| 7 | What is the theory of relativity? | 0.9411 |
-| 8 | Describe the water cycle in nature | 0.9375 |
-
-**Verdict**: Acceptable INT4 quantization quality (similarity ≥ 0.90)
-
-> Note: High SDT norm (0.96) indicates different wording but same semantic meaning.
-> Worst cases are creative/abstract prompts (quantum computing, poetry) where
-> multiple valid phrasings exist.
-
-### Built-in 27 Prompts — `run_wwb_builtin.py` (all 27, max_new_tokens=128)
+### WWB Built-in 27 Prompts (max_new_tokens=128)
 
 | Metric | Value |
 |--------|-------|

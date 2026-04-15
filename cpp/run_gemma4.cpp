@@ -19,6 +19,9 @@
  *   # CPU
  *   run_gemma4.exe --model-dir gemma-4-E2B-it-ov --device CPU --prompt "Hello!"
  *
+ *   # Disable mmap + show memory
+ *   run_gemma4.exe --model-dir gemma-4-E2B-it-ov --no-mmap --show-memory
+ *
  *   # Prompt from file
  *   run_gemma4.exe --model-dir gemma-4-E2B-it-ov --prompt-file prompt.txt
  */
@@ -31,6 +34,12 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
 
 #include "openvino/genai/visual_language/pipeline.hpp"
 #include "load_image.hpp"
@@ -46,6 +55,8 @@ struct Args {
     std::string prompt_file;
     std::string image_path;
     size_t      max_new_tokens = 256;
+    bool        no_mmap     = false;
+    bool        show_memory = false;
 };
 
 static void print_usage(const char* prog) {
@@ -59,6 +70,8 @@ static void print_usage(const char* prog) {
         << "  --prompt-file <path>      Read prompt from a text file (overrides --prompt)\n"
         << "  --image <path>            Optional image file for multimodal inference\n"
         << "  --max-new-tokens <N>      Maximum tokens to generate (default: 256)\n"
+        << "  --no-mmap                 Disable memory-mapped model loading\n"
+        << "  --show-memory             Print process memory (RSS / peak) at key stages\n"
         << "  --help                    Show this help message\n";
 }
 
@@ -78,6 +91,10 @@ static Args parse_args(int argc, char* argv[]) {
             args.image_path = argv[++i];
         } else if ((a == "--max-new-tokens") && i + 1 < argc) {
             args.max_new_tokens = std::stoull(argv[++i]);
+        } else if (a == "--no-mmap") {
+            args.no_mmap = true;
+        } else if (a == "--show-memory") {
+            args.show_memory = true;
         } else if (a == "--help" || a == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -108,6 +125,57 @@ static std::string read_text_file(const fs::path& path) {
         text.pop_back();
     }
     return text;
+}
+
+static std::string read_file_raw(const fs::path& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        throw std::runtime_error("Cannot open file: " + path.string());
+    }
+    auto size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    std::string data(static_cast<size_t>(size), '\0');
+    f.read(data.data(), size);
+    return data;
+}
+
+static ov::Tensor read_bin_to_tensor(const fs::path& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        throw std::runtime_error("Cannot open binary file: " + path.string());
+    }
+    auto size = static_cast<size_t>(f.tellg());
+    f.seekg(0, std::ios::beg);
+    ov::Tensor tensor(ov::element::u8, {size});
+    f.read(reinterpret_cast<char*>(tensor.data()), size);
+    return tensor;
+}
+
+// ── Memory measurement (Windows) ───────────────────────────────────────────
+
+struct MemInfo {
+    double rss_mb  = 0.0;
+    double peak_mb = 0.0;
+};
+
+static MemInfo get_memory() {
+    MemInfo info;
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        info.rss_mb  = static_cast<double>(pmc.WorkingSetSize)     / (1024.0 * 1024.0);
+        info.peak_mb = static_cast<double>(pmc.PeakWorkingSetSize) / (1024.0 * 1024.0);
+    }
+#endif
+    return info;
+}
+
+static void print_memory(const char* label) {
+    auto mem = get_memory();
+    if (mem.rss_mb > 0) {
+        std::cout << "  [" << label << "]  RSS: " << std::fixed << std::setprecision(0)
+                  << mem.rss_mb << " MB  |  Peak: " << mem.peak_mb << " MB\n";
+    }
 }
 
 // ── Print performance metrics ──────────────────────────────────────────────
@@ -176,11 +244,60 @@ int main(int argc, char* argv[]) {
 
         // Load model
         std::cout << "Loading VLMPipeline from " << model_dir << " on " << args.device << "...\n";
+        if (args.no_mmap) {
+            std::cout << "  (mmap disabled -- weights will be copied into RAM)\n";
+        }
+        if (args.show_memory) {
+            std::cout << "\n";
+            print_memory("Before loading");
+        }
+
         auto t0 = std::chrono::steady_clock::now();
-        ov::genai::VLMPipeline pipe(model_dir, args.device);
+        ov::AnyMap properties;
+
+        // Build pipeline — with or without mmap
+        std::unique_ptr<ov::genai::VLMPipeline> pipe_ptr;
+
+        if (args.no_mmap) {
+            // Load model components manually into heap memory (no mmap).
+            // VLMPipeline second constructor: models map + tokenizer + config_dir.
+            const std::vector<std::string> model_names = {
+                "language", "text_embeddings", "text_embeddings_per_layer",
+                "vision_embeddings",
+            };
+            std::map<std::string, std::pair<std::string, ov::Tensor>> models;
+            for (const auto& name : model_names) {
+                auto xml_path = model_dir / ("openvino_" + name + "_model.xml");
+                auto bin_path = model_dir / ("openvino_" + name + "_model.bin");
+                if (fs::exists(xml_path) && fs::exists(bin_path)) {
+                    models[name] = {read_file_raw(xml_path), read_bin_to_tensor(bin_path)};
+                }
+            }
+
+            // Load tokenizer + detokenizer
+            auto tok_xml   = read_file_raw(model_dir / "openvino_tokenizer.xml");
+            auto tok_bin   = read_bin_to_tensor(model_dir / "openvino_tokenizer.bin");
+            auto detok_xml = read_file_raw(model_dir / "openvino_detokenizer.xml");
+            auto detok_bin = read_bin_to_tensor(model_dir / "openvino_detokenizer.bin");
+            ov::genai::Tokenizer tokenizer(tok_xml, tok_bin, detok_xml, detok_bin);
+
+            pipe_ptr = std::make_unique<ov::genai::VLMPipeline>(
+                models, tokenizer, model_dir, args.device, properties
+            );
+        } else {
+            pipe_ptr = std::make_unique<ov::genai::VLMPipeline>(
+                model_dir, args.device, properties
+            );
+        }
+        auto& pipe = *pipe_ptr;
+
         auto t1 = std::chrono::steady_clock::now();
         double load_s = std::chrono::duration<double>(t1 - t0).count();
         std::cout << "Model loaded in " << std::fixed << std::setprecision(1) << load_s << "s\n";
+
+        if (args.show_memory) {
+            print_memory("After loading (peak)");
+        }
 
         // Generation config
         ov::genai::GenerationConfig config;
@@ -214,6 +331,12 @@ int main(int argc, char* argv[]) {
         }
 
         std::cout << "\n\n";
+
+        // Memory after generation (stabilized)
+        if (args.show_memory) {
+            print_memory("After generation (stabilized)");
+            std::cout << "\n";
+        }
 
         // Print performance metrics
         print_perf_metrics(result.perf_metrics);

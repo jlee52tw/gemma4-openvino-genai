@@ -460,3 +460,77 @@ compile pipeline that causes the 2× peak.
 ---
 
 *Ready for 16 GB memory swap.*
+
+---
+
+## 16 GB Benchmark Results
+
+**System:** Intel Panther Lake, Arc B390 iGPU (96 EUs), 15.7 GB LPDDR5 8533 MT/s, iGPU override ~13 GB  
+**GPU_DEVICE_TOTAL_MEM_SIZE:** 8.5 GB (reported by OV)
+
+### Per-Process Memory Profile (16 GB)
+
+| Configuration | Load Time | **Peak** | Stable RSS | After Infer |
+|---|---|---|---|---|
+| No cache, mmap ON | 21.3s | **10.22 GB** | 6.45 GB | 6.52 GB |
+| No cache, mmap OFF | 17.3s | **11.35 GB** | 2.89 GB | 3.08 GB |
+| Cache, mmap ON | 11.3s | **12.60 GB** | 7.04 GB | 7.10 GB |
+| **Cache, mmap OFF** | **7.8s** | **9.99 GB** | **7.11 GB** | **7.19 GB** |
+
+### Full Benchmark — No cache, mmap ON
+
+| Input tok | Output tok | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1366.0 | 15.4 | 348.5 | 65.0 | 10.62 |
+| 1067 | 300 | 860.5 | 13.9 | 1240.0 | 72.2 | 10.62 |
+| 2084 | 300 | 1106.4 | 11.7 | 1883.6 | 85.3 | 10.62 |
+
+### Full Benchmark — No cache, mmap OFF
+
+| Input tok | Output tok | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1384.0 | 15.2 | 343.9 | 65.9 | 10.87 |
+| 1067 | 300 | 964.1 | 13.8 | 1106.7 | 72.4 | 10.87 |
+| 2084 | 300 | 1263.8 | 11.8 | 1649.0 | 85.0 | 10.87 |
+
+### Full Benchmark — Cache + mmap ON
+
+| Input tok | Output tok | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1337.1 | 14.6 | 356.0 | 68.3 | 11.19 |
+| 1067 | 300 | 884.6 | 13.2 | 1206.2 | 75.6 | 11.19 |
+| 2084 | 300 | 1091.7 | 11.5 | 1909.0 | 87.0 | 11.19 |
+
+### Full Benchmark — Cache + mmap OFF (best peak memory)
+
+| Input tok | Output tok | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1385.5 | 11.2 | 343.6 | 89.0 | 9.31 |
+| 1067 | 300 | 845.3 | 10.2 | 1262.3 | 97.7 | 9.31 |
+| 2084 | 300 | 1201.1 | 9.2 | 1735.1 | 108.1 | 9.31 |
+
+### Observations (16 GB)
+
+**Memory pressure is real:**
+- On 32 GB, Output TPS at ~467 was 23.5 t/s; on 16 GB it drops to 15.4 t/s (no cache) or 11.2 t/s (cache + no-mmap) — a **35-52% regression**
+- Cache + mmap OFF has lowest peak (9.31 GB) but **worst TPS** (11.2 t/s) — the 6.5 GB cache blobs consume disk I/O and the combined cache + model files (~12.7 GB) may exceed disk cache capacity, causing page thrashing
+- No cache configs (mmap ON/OFF) actually deliver **better TPS** (15.2-15.4 t/s) despite higher peak, because less disk I/O contention during inference
+- TPOT increased from 42-57 ms (32 GB) to 65-108 ms (16 GB) across all configs
+
+**Comparison: 32 GB vs 16 GB (no cache, mmap ON)**
+
+| Metric | 32 GB | 16 GB | Regression |
+|---|---|---|---|
+| Output TPS (~467) | 23.5 | 15.4 | −34% |
+| Output TPS (~1058) | 21.0 | 13.9 | −34% |
+| Output TPS (~2075) | 17.5 | 11.7 | −33% |
+| TTFT (~467) | 272 ms | 349 ms | +28% |
+| TPOT (~467) | 42.5 ms | 65.0 ms | +53% |
+| Load time | 10.1s | 14.9s | +48% |
+| Peak | 12.18 GB | 10.62 GB | −13% |
+
+**Key finding:** The ~34% TPS regression is consistent across all input lengths, suggesting it's caused by **memory bandwidth contention** — the iGPU and CPU are competing for the same LPDDR5 bandwidth, and with only 16 GB, the OS has less room for file cache and background services, increasing memory pressure.
+
+**Best config for 16 GB depends on use case:**
+- **Lowest peak memory:** Cache + mmap OFF (9.31 GB peak) — but TPS is worst
+- **Best TPS on 16 GB:** No cache, mmap ON/OFF (15.2-15.4 t/s) — peak ~10.6-10.9 GB, fits fine

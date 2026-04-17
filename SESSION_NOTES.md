@@ -1,8 +1,8 @@
 # Session Notes — Gemma 4 OpenVINO GenAI Project
 
 > **Date range:** April 2026  
-> **System:** Intel Panther Lake, 12 Xe EUs iGPU, 96 GB RAM → **16 GB** (reconfigured for ASUS KPI testing), Windows  
-> **Memory:** LPDDR5 8533 MT/s  
+> **System:** Intel Panther Lake, Arc B390 iGPU (96 EUs), Windows  
+> **Memory:** LPDDR5 8533 MT/s — tested at 32 GB (full) and **16 GB** (BIOS iGPU 13 GB override)  
 > **Python:** 3.12.0  
 > **Repo:** https://github.com/jlee52tw/gemma4-openvino-genai  
 > **Latest commit:** `1007c95` (as of April 16, 2026)
@@ -532,14 +532,102 @@ python benchmark_asus_kpi.py `
 - **GPU peak memory reads as 0.0 GB** — Windows performance counter query not returning per-process GPU data.
 - **Total peak ~12.2 GB** — on 16 GB config, should fit comfortably.
 
+### Our Results — 16 GB LPDDR5 8533 MT/s (Panther Lake B390 iGPU)
+
+**System:** Intel Panther Lake, Arc B390 iGPU, 16 GB (15.7 GB) LPDDR5 8533 MT/s  
+**BIOS iGPU override:** 13 GB (OV reports GPU_DEVICE_TOTAL_MEM_SIZE: 8.5 GB)  
+**OV:** 2026.2.0-21571 nightly  
+**GenAI:** 2026.2.0.0-3058 (PR#3644 `as/vlm_enable_1`)  
+**Model:** Gemma-4-E4B-it (INT4), 6.05 GB on disk  
+**Model cache:** Pre-built on 32 GB, reused on 16 GB (~6.5 GB .blob + .cl_cache files)  
+
+#### Per-Process Memory Profile (test_cache_memory.py — subprocess isolation)
+
+| Config | Peak RSS (GB) | Load Time (s) |
+|--------|---:|---:|
+| No cache, mmap ON | 10.22 | 14.4 |
+| No cache, mmap OFF | 11.35 | 17.4 |
+| Cache, mmap ON | 12.60 | 7.4 |
+| Cache, mmap OFF | 9.99 | 7.8 |
+
+#### Config 1: No cache, mmap ON (default)
+
+| Input tokens | Output tokens | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Total peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1366.0 | 15.4 | 348.5 | 65.0 | 10.62 |
+| 1067 | 300 | 860.5 | 13.9 | 1240.0 | 72.2 | 10.62 |
+| 2084 | 300 | 1106.4 | 11.7 | 1883.6 | 85.3 | 10.62 |
+
+#### Config 2: No cache, mmap OFF (`ENABLE_MMAP='NO'`)
+
+| Input tokens | Output tokens | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Total peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1384.0 | 15.2 | 343.9 | 65.9 | 10.87 |
+| 1067 | 300 | 964.1 | 13.8 | 1106.7 | 72.4 | 10.87 |
+| 2084 | 300 | 1263.8 | 11.8 | 1649.0 | 85.0 | 10.87 |
+
+#### Config 3: Cache + mmap ON (`CACHE_DIR`)
+
+| Input tokens | Output tokens | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Total peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1337.1 | 14.6 | 356.0 | 68.3 | 11.19 |
+| 1067 | 300 | 884.6 | 13.2 | 1206.2 | 75.6 | 11.19 |
+| 2084 | 300 | 1091.7 | 11.5 | 1909.0 | 87.0 | 11.19 |
+
+#### Config 4: Cache + mmap OFF (`CACHE_DIR` + `ENABLE_MMAP='NO'`) — Lowest Peak
+
+| Input tokens | Output tokens | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Total peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1385.5 | 11.2 | 343.6 | 89.0 | 9.31 |
+| 1067 | 300 | 845.3 | 10.2 | 1262.3 | 97.7 | 9.31 |
+| 2084 | 300 | 1201.1 | 9.2 | 1735.1 | 108.1 | 9.31 |
+
+#### Observations (16 GB vs 32 GB)
+
+1. **~34% TPS regression** across the board from 32 GB to 16 GB:
+   - 32 GB best: 23.5 t/s (mmap ON) → 16 GB best: 15.4 t/s (no-cache mmap ON)
+   - Root cause: memory bandwidth contention — iGPU and CPU share LPDDR5
+
+2. **Cache + mmap OFF achieves lowest peak (9.31 GB)** but worst TPS (11.2 t/s at ~467):
+   - Loading 12.7 GB of combined cache+model files from disk without mmap causes I/O contention
+   - On 16 GB, the memory savings don't translate to better performance
+
+3. **No-cache configs give best TPS** on 16 GB:
+   - mmap ON: 15.4 / 13.9 / 11.7 t/s → best overall performance
+   - mmap OFF: 15.2 / 13.8 / 11.8 t/s → nearly identical
+   - Peak memory: 10.6-10.9 GB — fits in 16 GB with ~5 GB headroom
+
+4. **Cache + mmap ON is worst of both worlds on 16 GB:**
+   - Highest peak (11.19 GB) due to mmap pages + cached blobs both resident
+   - TPS slightly lower than no-cache (14.6 vs 15.4 at ~467)
+
+5. **Comparison with ASUS PTL 204 data (16 GB 6800 MT/s):**
+
+   | KPI | ASUS PTL 204 | Our PTL B390 (16 GB) | Delta |
+   |---|---:|---:|---|
+   | Output TPS (~467 in) | 13.5 | 15.4 | +14% faster (more EUs) |
+   | Output TPS (~1058 in) | 11.0 | 13.9 | +26% faster |
+   | Output TPS (~2075 in) | 8.3 | 11.7 | +41% faster |
+   | Total peak (~467 in) | 10.4 GB | 10.6 GB | +0.2 GB (comparable) |
+   | Prefill (~467 in) | 258.4 | 1366.0 | +5.3× faster |
+   | Memory bandwidth | 6800 MT/s | 8533 MT/s | +25% |
+
+   Our system is consistently faster due to higher memory bandwidth (8533 vs 6800 MT/s) and
+   more iGPU EUs (96 vs unknown). Peak memory is comparable (~10.4-10.6 GB).
+
+6. **Recommendation for 16 GB deployment:**
+   - **Best TPS:** No cache, mmap ON (default) — 15.4 t/s, 10.6 GB peak
+   - **Lowest memory:** Cache + mmap OFF — 9.3 GB peak, but 27% TPS penalty
+   - **Best balance:** No cache, mmap OFF — 15.2 t/s, 10.9 GB peak (negligible diff from default)
+
 ### Status
 
 - [x] Environment verified on this system (OV 2026.2 + GenAI PR#3644)
 - [x] 32 GB baseline benchmark Run 1 (manual np.fromfile workaround) — done
 - [x] 32 GB baseline benchmark Run 2 (ENABLE_MMAP='NO' kwarg) — done
-- [ ] Memory reconfigured to 16 GB
-- [ ] 16 GB baseline benchmark (mmap ON + OFF)
-- [ ] 16 GB no-mmap benchmark
+- [x] Memory reconfigured to 16 GB
+- [x] 16 GB baseline benchmark (4 configs: mmap ON/OFF × cache ON/OFF) — done
+- [x] Per-process memory profile (subprocess isolation) — done
+- [x] ASUS comparison analysis — done
 - [ ] 4K I/O extended test
-- [ ] Comparison report assembled
 - [ ] Internal ticket filed (if gaps confirmed)

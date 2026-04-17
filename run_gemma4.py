@@ -175,32 +175,7 @@ def main():
     t0 = time.perf_counter()
 
     if args.no_mmap:
-        # Load model components manually into heap memory (no mmap).
-        # VLMPipeline second constructor: models dict + tokenizer + config_dir.
-        model_names = [
-            "language", "text_embeddings", "text_embeddings_per_layer",
-            "vision_embeddings",
-        ]
-        models = {}
-        for name in model_names:
-            xml_path = model_dir / f"openvino_{name}_model.xml"
-            bin_path = model_dir / f"openvino_{name}_model.bin"
-            if xml_path.exists() and bin_path.exists():
-                xml_str = xml_path.read_text(encoding="utf-8")
-                weights = np.fromfile(str(bin_path), dtype=np.uint8)
-                models[name] = (xml_str, ov.Tensor(weights))
-
-        # Load tokenizer + detokenizer
-        tok_xml   = (model_dir / "openvino_tokenizer.xml").read_text("utf-8")
-        tok_bin   = np.fromfile(str(model_dir / "openvino_tokenizer.bin"),   dtype=np.uint8)
-        detok_xml = (model_dir / "openvino_detokenizer.xml").read_text("utf-8")
-        detok_bin = np.fromfile(str(model_dir / "openvino_detokenizer.bin"), dtype=np.uint8)
-        tokenizer = ov_genai.Tokenizer(tok_xml, ov.Tensor(tok_bin),
-                                       detok_xml, ov.Tensor(detok_bin))
-
-        pipe = ov_genai.VLMPipeline(
-            models, tokenizer, str(model_dir), args.device,
-        )
+        pipe = ov_genai.VLMPipeline(str(model_dir), args.device, ENABLE_MMAP='NO')
     else:
         pipe = ov_genai.VLMPipeline(str(model_dir), args.device)
 

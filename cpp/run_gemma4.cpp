@@ -127,30 +127,6 @@ static std::string read_text_file(const fs::path& path) {
     return text;
 }
 
-static std::string read_file_raw(const fs::path& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) {
-        throw std::runtime_error("Cannot open file: " + path.string());
-    }
-    auto size = f.tellg();
-    f.seekg(0, std::ios::beg);
-    std::string data(static_cast<size_t>(size), '\0');
-    f.read(data.data(), size);
-    return data;
-}
-
-static ov::Tensor read_bin_to_tensor(const fs::path& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) {
-        throw std::runtime_error("Cannot open binary file: " + path.string());
-    }
-    auto size = static_cast<size_t>(f.tellg());
-    f.seekg(0, std::ios::beg);
-    ov::Tensor tensor(ov::element::u8, {size});
-    f.read(reinterpret_cast<char*>(tensor.data()), size);
-    return tensor;
-}
-
 // ── Memory measurement (Windows) ───────────────────────────────────────────
 
 struct MemInfo {
@@ -255,41 +231,11 @@ int main(int argc, char* argv[]) {
         auto t0 = std::chrono::steady_clock::now();
         ov::AnyMap properties;
 
-        // Build pipeline — with or without mmap
-        std::unique_ptr<ov::genai::VLMPipeline> pipe_ptr;
-
         if (args.no_mmap) {
-            // Load model components manually into heap memory (no mmap).
-            // VLMPipeline second constructor: models map + tokenizer + config_dir.
-            const std::vector<std::string> model_names = {
-                "language", "text_embeddings", "text_embeddings_per_layer",
-                "vision_embeddings",
-            };
-            std::map<std::string, std::pair<std::string, ov::Tensor>> models;
-            for (const auto& name : model_names) {
-                auto xml_path = model_dir / ("openvino_" + name + "_model.xml");
-                auto bin_path = model_dir / ("openvino_" + name + "_model.bin");
-                if (fs::exists(xml_path) && fs::exists(bin_path)) {
-                    models[name] = {read_file_raw(xml_path), read_bin_to_tensor(bin_path)};
-                }
-            }
-
-            // Load tokenizer + detokenizer
-            auto tok_xml   = read_file_raw(model_dir / "openvino_tokenizer.xml");
-            auto tok_bin   = read_bin_to_tensor(model_dir / "openvino_tokenizer.bin");
-            auto detok_xml = read_file_raw(model_dir / "openvino_detokenizer.xml");
-            auto detok_bin = read_bin_to_tensor(model_dir / "openvino_detokenizer.bin");
-            ov::genai::Tokenizer tokenizer(tok_xml, tok_bin, detok_xml, detok_bin);
-
-            pipe_ptr = std::make_unique<ov::genai::VLMPipeline>(
-                models, tokenizer, model_dir, args.device, properties
-            );
-        } else {
-            pipe_ptr = std::make_unique<ov::genai::VLMPipeline>(
-                model_dir, args.device, properties
-            );
+            properties["ENABLE_MMAP"] = false;
         }
-        auto& pipe = *pipe_ptr;
+
+        auto pipe = ov::genai::VLMPipeline(model_dir, args.device, properties);
 
         auto t1 = std::chrono::steady_clock::now();
         double load_s = std::chrono::duration<double>(t1 - t0).count();

@@ -391,18 +391,21 @@ def get_model_size_gb(model_dir: Path) -> float:
 
 def get_cache_size_gb(model_dir: Path) -> float:
     """Sum the OV cache directory size (model_cache/ or similar)."""
-    # OV typically creates cache in model_dir or a system-wide cache
     # Check common cache locations
     cache_dirs = [
         model_dir / "cache",
         model_dir / "model_cache",
     ]
-    # Also check for .blob files in model dir
-    blob_size = sum(f.stat().st_size for f in model_dir.rglob("*.blob"))
+    total_size = 0
+    found_cache_dir = False
     for cd in cache_dirs:
         if cd.exists():
-            blob_size += sum(f.stat().st_size for f in cd.rglob("*") if f.is_file())
-    return blob_size / (1024 ** 3)
+            found_cache_dir = True
+            total_size += sum(f.stat().st_size for f in cd.rglob("*") if f.is_file())
+    # Only count top-level .blob files if no cache directory was found
+    if not found_cache_dir:
+        total_size = sum(f.stat().st_size for f in model_dir.glob("*.blob"))
+    return total_size / (1024 ** 3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

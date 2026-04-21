@@ -15,7 +15,8 @@ KPIs measured:
       * Prefill Speed (tokens/s)  = input_tokens / TTFT
       * Output TPS (tokens/s)     = output_tokens / (total_time - TTFT)
       * Total peak memory (GB)    = process peak working set
-      * GPU peak memory (GB)      = GPU dedicated+shared via Windows PDH counters
+      * Private memory (GB)       = process private bytes (Task Manager "Details" view)
+  - Model load time (s)
   - mmap on / off comparison
 
 Designed to match ASUS test methodology:
@@ -353,7 +354,7 @@ class ScenarioResult:
     ttft_ms: float = 0.0
     tpot_ms: float = 0.0             # 1000 / output_tps
     total_peak_memory_gb: float = 0.0
-    gpu_peak_memory_gb: float = 0.0
+    private_memory_gb: float = 0.0   # process private bytes
     total_time_s: float = 0.0
 
 
@@ -375,6 +376,7 @@ class FullReport:
     system_memory_gb: float = 0.0
     ov_version: str = ""
     genai_version: str = ""
+    model_load_time_s: float = 0.0
     cache_info: CacheInfo = field(default_factory=CacheInfo)
     scenarios: List[ScenarioResult] = field(default_factory=list)
 
@@ -490,12 +492,9 @@ def measure_cache_creation(
 
     peak_after = get_peak_working_set_gb()
     rss_after = get_rss_gb()
-    gpu_mem = get_gpu_memory_gb()
 
     print(f"  Cache creation time: {cache_time:.1f}s")
     print(f"  Memory after load: RSS={rss_after:.2f} GB, Peak={peak_after:.2f} GB")
-    if gpu_mem > 0:
-        print(f"  GPU memory after load: {gpu_mem:.2f} GB")
 
     cache_size = get_cache_size_gb(model_dir)
     if cache_dir:
@@ -590,7 +589,7 @@ def run_scenario(
 
     # Memory
     total_peak = get_peak_working_set_gb()
-    gpu_mem = get_gpu_memory_gb()
+    private_mem = psutil.Process(os.getpid()).memory_info().private / (1024 ** 3)
 
     # Also try to get metrics from PerfMetrics if available
     try:
@@ -629,7 +628,7 @@ def run_scenario(
         ttft_ms=ttft_ms,
         tpot_ms=tpot_ms,
         total_peak_memory_gb=total_peak,
-        gpu_peak_memory_gb=gpu_mem,
+        private_memory_gb=private_mem,
         total_time_s=total_time,
     )
 
@@ -640,8 +639,7 @@ def run_scenario(
     print(f"    Output TPS       : {sr.output_tps:.1f} tokens/s")
     print(f"    TPOT             : {sr.tpot_ms:.1f} ms")
     print(f"    Total peak mem   : {sr.total_peak_memory_gb:.2f} GB")
-    if sr.gpu_peak_memory_gb > 0:
-        print(f"    GPU peak mem     : {sr.gpu_peak_memory_gb:.2f} GB")
+    print(f"    Private mem      : {sr.private_memory_gb:.2f} GB")
     print(f"    Total time       : {sr.total_time_s:.2f} s")
 
     return sr
@@ -668,6 +666,7 @@ def print_report(report: FullReport):
     print(f"  OpenVINO       : {report.ov_version}")
     print(f"  openvino-genai : {report.genai_version}")
     print()
+    print(f"  Model load time: {report.model_load_time_s:.1f} s")
     print(f"  Cache size     : {report.cache_info.cache_size_gb:.2f} GB")
     print(f"  Cache time     : {report.cache_info.cache_creation_time_s:.1f} s")
     print(f"  Cache peak mem : {report.cache_info.cache_peak_memory_gb:.2f} GB")
@@ -677,7 +676,7 @@ def print_report(report: FullReport):
     hdr = (
         f"  {'Input tokens':>13} {'Output tokens':>14} "
         f"{'Prefill (t/s)':>14} {'Output TPS':>11} "
-        f"{'Total peak (GB)':>16} {'GPU peak (GB)':>14}"
+        f"{'Total peak (GB)':>16} {'Private (GB)':>13}"
     )
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
@@ -685,7 +684,7 @@ def print_report(report: FullReport):
         print(
             f"  {s.input_tokens:>13} {s.output_tokens:>14} "
             f"{s.prefill_speed_tps:>14.1f} {s.output_tps:>11.1f} "
-            f"{s.total_peak_memory_gb:>16.1f} {s.gpu_peak_memory_gb:>14.1f}"
+            f"{s.total_peak_memory_gb:>16.1f} {s.private_memory_gb:>13.1f}"
         )
 
     print()
@@ -835,6 +834,7 @@ def main():
         pipe = ov_genai.VLMPipeline(str(model_dir), args.device)
 
     load_time = time.perf_counter() - t0
+    report.model_load_time_s = load_time
     print(f"  Model loaded in {load_time:.1f}s (cache reuse), RSS={get_rss_gb():.2f} GB")
 
     # ── Step 3: Build prompts for each scenario ─────────────────────────────

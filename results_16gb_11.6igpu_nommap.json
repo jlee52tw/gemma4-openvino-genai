@@ -1,0 +1,54 @@
+{
+  "model_name": "gemma-4-E4B-it-ov",
+  "model_dir": "C:\\working\\gemma4-openvino\\gemma-4-E4B-it-ov",
+  "model_size_gb": 6.051606975495815,
+  "device": "GPU",
+  "mmap_mode": "OFF",
+  "cache_dir": "",
+  "system_memory_gb": 15.65423583984375,
+  "ov_version": "2026.2.0-21622-fdad5b35a43",
+  "genai_version": "2026.2.0.0-3058-31eaf96b2e5-as/vlm_enable_1",
+  "cache_info": {
+    "cache_creation_time_s": 0.0,
+    "cache_peak_memory_gb": 0.0,
+    "cache_size_gb": 12.588121486827731
+  },
+  "scenarios": [
+    {
+      "scenario": "~467",
+      "input_tokens": 476,
+      "output_tokens": 300,
+      "prefill_speed_tps": 1157.7624563117765,
+      "output_tps": 14.18543183683117,
+      "ttft_ms": 411.13787841796875,
+      "tpot_ms": 70.49485778808594,
+      "total_peak_memory_gb": 10.111076354980469,
+      "gpu_peak_memory_gb": 0.0,
+      "total_time_s": 21.494029699999373
+    },
+    {
+      "scenario": "~1058",
+      "input_tokens": 1067,
+      "output_tokens": 300,
+      "prefill_speed_tps": 887.4070903518536,
+      "output_tps": 12.812261734863444,
+      "ttft_ms": 1202.37939453125,
+      "tpot_ms": 78.05023193359375,
+      "total_peak_memory_gb": 10.111076354980469,
+      "gpu_peak_memory_gb": 0.0,
+      "total_time_s": 24.540732299996307
+    },
+    {
+      "scenario": "~2075",
+      "input_tokens": 2084,
+      "output_tokens": 300,
+      "prefill_speed_tps": 1112.797096737271,
+      "output_tps": 10.884680040382403,
+      "ttft_ms": 1872.75830078125,
+      "tpot_ms": 91.87224578857422,
+      "total_peak_memory_gb": 10.111076354980469,
+      "gpu_peak_memory_gb": 0.0,
+      "total_time_s": 29.34437489999982
+    }
+  ]
+}

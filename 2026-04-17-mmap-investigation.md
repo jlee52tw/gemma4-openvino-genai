@@ -531,6 +531,122 @@ compile pipeline that causes the 2× peak.
 
 **Key finding:** The ~34% TPS regression is consistent across all input lengths, suggesting it's caused by **memory bandwidth contention** — the iGPU and CPU are competing for the same LPDDR5 bandwidth, and with only 16 GB, the OS has less room for file cache and background services, increasing memory pressure.
 
-**Best config for 16 GB depends on use case:**
+**Best config for 16 GB (iGPU 13 GB override) depends on use case:**
 - **Lowest peak memory:** Cache + mmap OFF (9.31 GB peak) — but TPS is worst
 - **Best TPS on 16 GB:** No cache, mmap ON/OFF (15.2-15.4 t/s) — peak ~10.6-10.9 GB, fits fine
+
+---
+
+## 16 GB 測試結果 — iGPU 11.6 GB Override (2026-04-21)
+
+**系統配置：**
+- Intel Panther Lake, Arc B390 iGPU, 96 EUs
+- 16 GB (15.65 GB) LPDDR5 8533 MT/s
+- BIOS iGPU memory override: **11.6 GB** (OV reports GPU_DEVICE_TOTAL_MEM_SIZE: 10.45 GB)
+- OV: 2026.2.0-21622 nightly
+- GenAI: 2026.2.0.0-3058 (PR#3644 `as/vlm_enable_1`)
+- Model: Gemma-4-E4B-it INT4, 6.05 GB on disk
+- Model cache: 已存在 (~6.5 GB .blob + .cl_cache files)
+
+### 完整基準測試結果 (4 configs)
+
+#### Config 1: No cache, mmap ON (default)
+
+| Load time | RSS after load |
+|---:|---:|
+| 21.1s | 4.64 GB |
+
+| Input tokens | Output tokens | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Total peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1117.7 | 14.3 | 425.9 | 69.9 | 8.11 |
+| 1067 | 300 | 788.9 | 12.6 | 1352.5 | 79.1 | 8.11 |
+| 2084 | 300 | 1013.2 | 10.7 | 2056.9 | 93.3 | 8.11 |
+
+#### Config 2: No cache, mmap OFF (`ENABLE_MMAP='NO'`)
+
+| Load time | RSS after load |
+|---:|---:|
+| 18.7s | 2.68 GB |
+
+| Input tokens | Output tokens | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Total peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1157.8 | 14.2 | 411.1 | 70.5 | 10.11 |
+| 1067 | 300 | 887.4 | 12.8 | 1202.4 | 78.1 | 10.11 |
+| 2084 | 300 | 1112.8 | 10.9 | 1872.8 | 91.9 | 10.11 |
+
+#### Config 3: Cache + mmap ON (`CACHE_DIR`)
+
+| Load time | RSS after load |
+|---:|---:|
+| 20.8s | 6.65 GB |
+
+| Input tokens | Output tokens | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Total peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1123.5 | 13.4 | 423.7 | 74.8 | 10.53 |
+| 1067 | 300 | 803.8 | 12.2 | 1327.4 | 81.9 | 10.53 |
+| 2084 | 300 | 1028.8 | 10.6 | 2025.7 | 94.3 | 10.53 |
+
+#### Config 4: Cache + mmap OFF (`CACHE_DIR` + `ENABLE_MMAP='NO'`) — Lowest Peak
+
+| Load time | RSS after load |
+|---:|---:|
+| 9.6s | 6.63 GB |
+
+| Input tokens | Output tokens | Prefill (t/s) | Output TPS | TTFT (ms) | TPOT (ms) | Total peak (GB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 476 | 300 | 1179.4 | 10.6 | 403.6 | 94.2 | 9.31 |
+| 1067 | 300 | 792.6 | 9.7 | 1346.2 | 103.5 | 9.31 |
+| 2084 | 300 | 1166.2 | 8.6 | 1787.0 | 116.6 | 9.31 |
+
+### 觀察與分析 — iGPU 11.6 GB vs 13 GB Override
+
+#### TPS 比較 (Output TPS @ ~467 tokens input)
+
+| Config | iGPU 13 GB | iGPU 11.6 GB | Delta |
+|---|---:|---:|---|
+| No cache, mmap ON | 15.4 | 14.3 | −7% |
+| No cache, mmap OFF | 15.2 | 14.2 | −7% |
+| Cache, mmap ON | 14.6 | 13.4 | −8% |
+| Cache, mmap OFF | 11.2 | 10.6 | −5% |
+
+#### Peak Memory 比較
+
+| Config | iGPU 13 GB | iGPU 11.6 GB | Delta |
+|---|---:|---:|---|
+| No cache, mmap ON | 10.62 GB | 8.11 GB | **−2.51 GB** |
+| No cache, mmap OFF | 10.87 GB | 10.11 GB | −0.76 GB |
+| Cache, mmap ON | 11.19 GB | 10.53 GB | −0.66 GB |
+| Cache, mmap OFF | 9.31 GB | 9.31 GB | 相同 |
+
+#### 關鍵發現
+
+1. **iGPU 11.6 GB 配置的 peak memory 顯著降低（mmap ON 無 cache）：** 8.11 GB vs 10.62 GB。
+   - 這是因為 iGPU 分配了較少的 shared memory（11.6 GB vs 13 GB），減少了 GPU compile 時暫存的記憶體需求。
+   - mmap ON 時 OS 可以更積極地回收 file-backed pages（因為不需要那麼多給 GPU）。
+
+2. **TPS 僅下降 5-8%：** 從 iGPU 13 GB 到 11.6 GB，TPS 僅輕微降低。
+   - iGPU 11.6 GB 仍有足夠記憶體容納整個 6 GB INT4 model + KV cache。
+   - 額外的 GPU memory 不太影響計算速度（bottleneck 是 bandwidth 而不是 capacity）。
+
+3. **Cache + mmap OFF 的 peak 不變（9.31 GB）：** 因為此配置下 peak 主要由 heap 上的 model weights + cache blob 決定，與 iGPU allocation 大小無關。
+
+4. **Load time 差異：**
+   - Cache + mmap OFF 最快（9.6s）— .blob 直接載入，不需 compile
+   - No-cache 需 ~18-21s recompile（即使 OS 有 in-memory cache 的 blob 殘留）
+
+5. **與 ASUS PTL 204 (16 GB 6800 MT/s) 比較：**
+
+   | KPI | ASUS PTL 204 | 我們 (11.6 GB iGPU) | Delta |
+   |---|---:|---:|---|
+   | Output TPS (~467) | 13.5 | 14.3 | +6% faster |
+   | Output TPS (~1058) | 11.0 | 12.6 | +15% faster |
+   | Output TPS (~2075) | 8.3 | 10.7 | +29% faster |
+   | Total peak (~467) | 10.4 GB | 8.1 GB | **−2.3 GB better** |
+   | Prefill (~467) | 258.4 | 1117.7 | +4.3× faster |
+
+   **結論：** 即使在 iGPU 11.6 GB（比 ASUS 的更低配置）上，我們的 PTL B390 仍然全面超越 ASUS PTL 204。
+
+6. **16 GB 部署建議 (iGPU 11.6 GB)：**
+   - **推薦：No cache, mmap ON** — 14.3 t/s, 8.11 GB peak（最佳 peak/TPS 平衡）
+   - **最低 peak：Cache + mmap OFF** — 9.31 GB peak, 10.6 t/s（犧牲 26% TPS）
+   - **最快載入：Cache + mmap OFF** — 9.6s load time

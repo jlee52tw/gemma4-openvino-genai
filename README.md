@@ -13,7 +13,7 @@ models using the [`openvino.genai`](https://github.com/openvinotoolkit/openvino.
 |------|-------------|
 | `run_gemma4.py` | Simple inference script — text and image+text |
 | `benchmark.py` | Throughput / TTFT / memory benchmark |
-| `benchmark_asus_kpi.py` | ASUS KPI comparison benchmark (prefill, output TPS, peak memory) |
+| `benchmark_kpi.py` | KPI benchmark (prefill, output TPS, peak memory) |
 | `cpp/run_gemma4.cpp` | C++ inference — same features as `run_gemma4.py` |
 | `create_release.ps1` | Builds a self-contained runtime folder with `setupvars` |
 | `requirements.txt` | Runtime dependencies (inference only) |

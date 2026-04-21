@@ -24,9 +24,16 @@ file(DOWNLOAD
     ${CMAKE_BINARY_DIR}/stb_image.h
     EXPECTED_HASH MD5=27932e6fb3a2f26aee2fc33f2cb4e696)
 
-# ── Build executable ───────────────────────────────────────────────────────
+# ── Build executable: run_gemma4 ───────────────────────────────────────────
 add_executable(run_gemma4 run_gemma4.cpp load_image.cpp)
 target_include_directories(run_gemma4 PRIVATE "${CMAKE_BINARY_DIR}")
 target_link_libraries(run_gemma4 PRIVATE openvino::genai)
 
-install(TARGETS run_gemma4 RUNTIME DESTINATION bin)
+# ── Build executable: benchmark_kpi ────────────────────────────────────────
+add_executable(benchmark_kpi benchmark_kpi.cpp)
+target_link_libraries(benchmark_kpi PRIVATE openvino::genai)
+if(WIN32)
+    target_link_libraries(benchmark_kpi PRIVATE psapi)
+endif()
+
+install(TARGETS run_gemma4 benchmark_kpi RUNTIME DESTINATION bin)

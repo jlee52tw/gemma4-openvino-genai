@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Gemma 4 E4B — ASUS KPI Comparison Benchmark
-=============================================
-Measures the same KPIs that ASUS reported for Gemma-4-e4b-it (INT4) via
-VLMPipeline, so we can compare head-to-head against their Llama 3.1 8B
-numbers on 16 GB / 32 GB configurations.
+Gemma 4 E4B — KPI Benchmark
+============================
+Measures key performance indicators for Gemma-4-e4b-it (INT4) via
+VLMPipeline on 16 GB / 32 GB configurations.
 
 KPIs measured:
   - Model size on disk (GB)
@@ -19,15 +18,14 @@ KPIs measured:
   - Model load time (s)
   - mmap on / off comparison
 
-Designed to match ASUS test methodology:
+Test methodology:
   - Input ~467, ~1058, ~2075 tokens
   - Output until model stops or reaches max_new_tokens
 
 Usage:
-  python benchmark_asus_kpi.py --model-dir ./gemma-4-E4B-it-ov --device GPU
-  python benchmark_asus_kpi.py --model-dir ./gemma-4-E4B-it-ov --device GPU --no-mmap
-  python benchmark_asus_kpi.py --model-dir ./gemma-4-E4B-it-ov --device GPU --scenarios 467 1058 2075
-  python benchmark_asus_kpi.py --model-dir ./gemma-4-E4B-it-ov --device GPU --max-new-tokens 300
+  python benchmark_kpi.py --model-dir ./gemma-4-E4B-it-ov --device GPU --prompt-file prompt.txt
+  python benchmark_kpi.py --model-dir ./gemma-4-E4B-it-ov --device GPU --no-mmap --prompt-file p1.txt p2.txt
+  python benchmark_kpi.py --model-dir ./gemma-4-E4B-it-ov --device GPU --prompt-file prompt.txt --max-new-tokens 300
 
 Notes:
   - Run on a clean boot for best memory measurement accuracy.
@@ -169,176 +167,7 @@ def reset_peak_working_set():
             pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Long prompt material (same as benchmark.py, expanded)
-# ─────────────────────────────────────────────────────────────────────────────
 
-_LONG_RAW_TEXT = """\
-The Transformer architecture, introduced in the seminal paper "Attention Is All \
-You Need" by Vaswani et al. in 2017, fundamentally changed the landscape of \
-natural language processing and, subsequently, many other domains of machine \
-learning. At its core, the Transformer relies on a mechanism called \
-self-attention, which allows the model to weigh the importance of different \
-positions in the input sequence when computing a representation of each \
-position. Unlike recurrent neural networks (RNNs) or long short-term memory \
-networks (LSTMs), which process sequences step by step, the Transformer \
-processes all positions simultaneously, making it highly parallelizable and \
-efficient on modern hardware accelerators such as GPUs and TPUs.
-
-The self-attention mechanism operates by computing three vectors for each input \
-token: a query vector (Q), a key vector (K), and a value vector (V). The \
-attention score between any two positions is computed as the dot product of the \
-query at one position with the key at another, scaled by the square root of the \
-key dimension. These scores are then passed through a softmax function to \
-produce attention weights, which are used to compute a weighted sum of the value \
-vectors. This produces the output for each position. In practice, the \
-computation is done in matrix form: Attention(Q, K, V) = softmax(QK^T / \
-sqrt(d_k)) * V, where d_k is the dimension of the key vectors.
-
-Multi-head attention extends this mechanism by running multiple attention \
-operations in parallel, each with its own learned projection matrices. The \
-outputs of these parallel heads are concatenated and linearly projected to \
-produce the final output. This allows the model to attend to information from \
-different representation subspaces at different positions, greatly increasing \
-the expressiveness of the attention mechanism. A typical large language model \
-might use anywhere from 8 to 128 attention heads, depending on its size.
-
-The Transformer encoder consists of a stack of identical layers, each containing \
-a multi-head self-attention sub-layer followed by a position-wise feed-forward \
-network. Each sub-layer is surrounded by a residual connection and layer \
-normalization. The feed-forward network consists of two linear transformations \
-with a nonlinear activation function (typically ReLU or GELU) in between. The \
-decoder has a similar structure but includes an additional cross-attention \
-sub-layer that attends to the encoder output, and the self-attention in the \
-decoder is masked to prevent positions from attending to subsequent positions, \
-maintaining the autoregressive property.
-
-Positional encoding is a critical component since the Transformer has no \
-inherent notion of sequence order. The original Transformer used sinusoidal \
-positional encodings, where each dimension of the positional encoding \
-corresponds to a sinusoid with a different frequency. Modern variants often use \
-learned positional embeddings or rotary position embeddings (RoPE), which encode \
-relative positions through rotation matrices applied to the query and key \
-vectors. RoPE has become the standard in most large language models including \
-LLaMA, Gemma, and Mistral families, as it provides better generalization to \
-longer sequences than the original approach.
-
-The training process for large language models based on the Transformer involves \
-pre-training on massive text corpora using a language modeling objective. Causal \
-language models predict the next token given all previous tokens, which \
-naturally supports autoregressive text generation at inference time. The loss \
-function is the cross-entropy between the predicted probability distribution \
-over the vocabulary and the actual next token. The vocabulary itself is \
-typically constructed using subword tokenization methods such as Byte Pair \
-Encoding (BPE), WordPiece, or SentencePiece, which balance between \
-character-level and word-level representations. Gemma models, for instance, use \
-a SentencePiece tokenizer with a vocabulary size of 262,144 tokens, which is \
-significantly larger than many other model families.
-
-Optimization during training typically uses the AdamW optimizer with a learning \
-rate schedule that includes a warmup phase followed by cosine decay. Gradient \
-accumulation is used to simulate larger effective batch sizes when memory is \
-limited, and gradient clipping prevents exploding gradients during training. \
-Mixed precision training, using bfloat16 or float16 representations, reduces \
-memory usage and increases throughput on hardware that supports it. Distributed \
-training across multiple devices is essential for large models and involves \
-techniques such as data parallelism, tensor parallelism, and pipeline \
-parallelism, or combinations thereof.
-
-After pre-training, models undergo supervised fine-tuning (SFT) on curated \
-instruction-following datasets, followed by reinforcement learning from human \
-feedback (RLHF) or direct preference optimization (DPO). The SFT stage teaches \
-the model to follow instructions and produce helpful responses, while the \
-alignment stage refines the model's behavior to better match human preferences \
-and safety requirements. This multi-stage training pipeline has become standard \
-practice for building instruction-following language models.
-
-At inference time, text generation involves repeatedly sampling from the model's \
-predicted probability distribution over the next token. Various decoding \
-strategies are used, including greedy decoding (always selecting the \
-highest-probability token), beam search (maintaining multiple candidate \
-sequences), top-k sampling (restricting sampling to the k most likely tokens), \
-top-p (nucleus) sampling (restricting to the smallest set of tokens whose \
-cumulative probability exceeds a threshold p), and temperature scaling (dividing \
-logits by a temperature parameter to control randomness). The choice of decoding \
-strategy significantly affects the quality, diversity, and coherence of the \
-generated text. Key-value caching is used to avoid redundant computation during \
-autoregressive generation, storing the key and value projections from previous \
-timesteps so they do not need to be recomputed. This is essential for efficient \
-generation, especially for long sequences.
-
-Modern multimodal models extend the Transformer architecture to handle inputs \
-beyond text. Vision language models (VLMs) incorporate a vision encoder — \
-typically a Vision Transformer (ViT) — that processes images into a sequence of \
-patch embeddings. These visual tokens are then combined with text token \
-embeddings and fed into the language model. The vision encoder divides an input \
-image into fixed-size patches (commonly 16x16 or 14x14 pixels), linearly \
-projects each patch into an embedding vector, and processes these through \
-multiple Transformer layers. Some architectures use cross-attention layers to \
-fuse visual and textual information, while others simply concatenate visual and \
-text tokens in the input sequence. The Gemma 4 family uses a SigLIP-based \
-vision encoder with per-layer text embeddings, where visual features are \
-injected at specific layers of the language model rather than only at the input \
-layer, allowing for more nuanced multimodal reasoning throughout the network \
-depth.
-
-Quantization is a key technique for deploying large models efficiently. \
-Post-training quantization reduces the precision of model weights from floating \
-point (typically bfloat16 or float32) to lower-precision formats such as INT8 \
-or INT4. Group-wise quantization, where a small group of weights shares a \
-single scale factor, preserves more accuracy than per-tensor or per-channel \
-quantization at very low bit widths. The asymmetric variant allows for a \
-zero-point offset in addition to the scale, which can better represent \
-non-symmetric weight distributions. Mixed-precision quantization applies \
-different bit widths to different parts of the model based on their sensitivity \
-to precision loss, typically keeping embedding layers and attention mechanisms \
-at higher precision while aggressively quantizing feed-forward layers. The NNCF \
-(Neural Network Compression Framework) and OpenVINO toolkits provide automated \
-quantization pipelines that can compress models while maintaining accuracy \
-within acceptable bounds.
-
-Mixture of Experts (MoE) is another scaling technique that has gained popularity \
-in recent large language models. In an MoE layer, multiple feed-forward "expert" \
-sub-networks exist, and a gating network (router) selects a subset of experts \
-to process each token. This allows the total parameter count to be much larger \
-than the parameters active for any single token, providing better capacity \
-without a proportional increase in computation. The Gemma 4 26B-A4B model, for \
-example, has 25.2 billion total parameters but only 3.8 billion active \
-parameters per token, using 128 experts with a top-8 routing strategy. The \
-router is typically a simple linear layer that produces logits over all experts, \
-and the top-k experts (with the highest router logits) are selected. Load \
-balancing loss terms are added during training to ensure that tokens are \
-distributed evenly across experts, preventing the collapse phenomenon where only \
-a few experts receive most of the traffic.
-
-Hardware acceleration plays a crucial role in making inference practical for \
-large models. Intel's integrated GPUs in recent processors can accelerate model \
-inference through the OpenVINO toolkit, which optimizes models for Intel \
-hardware. The toolkit converts models to an Intermediate Representation (IR) \
-format and applies hardware-specific optimizations including operation fusion, \
-memory layout transformation, and automatic selection of optimal kernel \
-implementations. The iGPU shares system memory with the CPU, which means that \
-GPU memory usage directly impacts the total available system memory. On a 16 GB \
-system, this shared memory architecture means careful memory management is \
-critical — the model weights, KV cache, intermediate activations, and operating \
-system all compete for the same physical memory. Memory-mapped I/O (mmap) can \
-help by allowing the OS to page model data in and out as needed, but this can \
-introduce latency if the working set exceeds physical memory. Disabling mmap \
-forces all weights into the process heap, giving more predictable (but higher) \
-memory usage. Understanding these tradeoffs is essential for deploying LLMs on \
-memory-constrained client devices.
-
-The evolution of language models has also driven innovation in inference serving \
-systems and edge deployment strategies. Techniques such as continuous batching, \
-PagedAttention, speculative decoding, and model sharding enable efficient \
-deployment across diverse hardware configurations. For client-side deployment, \
-frameworks like OpenVINO, ONNX Runtime, llama.cpp, and TensorRT-LLM each offer \
-different tradeoffs between performance, flexibility, and hardware support. The \
-choice of framework depends on the target hardware, model architecture, and \
-application requirements. Intel's OpenVINO is particularly well-suited for \
-deployment on Intel CPUs and iGPUs, offering optimized kernels and quantization \
-support specifically tuned for Intel hardware.
-"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Result data class
@@ -411,25 +240,25 @@ def get_cache_size_gb(model_dir: Path) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Prompt builder
+# Prompt loader
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_prompt_with_target_tokens(tokenizer, target_tokens: int) -> Tuple[str, int]:
-    """Build a prompt with approximately `target_tokens` input tokens."""
-    full_ids = tokenizer.encode(_LONG_RAW_TEXT).input_ids.data.flatten().tolist()
-    if len(full_ids) < target_tokens:
-        # Repeat the text to get enough tokens
-        repeats = (target_tokens // len(full_ids)) + 2
-        extended_text = (_LONG_RAW_TEXT + "\n\n") * repeats
-        full_ids = tokenizer.encode(extended_text).input_ids.data.flatten().tolist()
+def load_prompt_file(filepath: str) -> str:
+    """Read prompt text from an external file."""
+    p = Path(filepath)
+    if not p.exists():
+        print(f"  Error: prompt file not found: {filepath}")
+        sys.exit(1)
+    text = p.read_text(encoding="utf-8").strip()
+    if not text:
+        print(f"  Error: prompt file is empty: {filepath}")
+        sys.exit(1)
+    return text
 
-    if len(full_ids) < target_tokens:
-        print(f"  WARNING: Could only produce {len(full_ids)} tokens (target: {target_tokens})")
-        target_tokens = len(full_ids)
 
-    trimmed_text = tokenizer.decode(full_ids[:target_tokens])
-    actual_count = len(tokenizer.encode(trimmed_text).input_ids.data.flatten().tolist())
-    return trimmed_text, actual_count
+def tokenize_prompt(tokenizer, prompt: str) -> int:
+    """Return the number of tokens in the prompt."""
+    return len(tokenizer.encode(prompt).input_ids.data.flatten().tolist())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -534,7 +363,8 @@ def run_scenario(
     print(f"\n  --- Scenario: {scenario_name} (input ~{input_tokens} tokens) ---")
 
     config = ov_genai.GenerationConfig()
-    config.max_new_tokens = max_new_tokens
+    if max_new_tokens > 0:
+        config.max_new_tokens = max_new_tokens
 
     gc.collect()
     time.sleep(1)
@@ -551,6 +381,8 @@ def run_scenario(
         token_count += 1
         if first_token_time is None:
             first_token_time = time.perf_counter()
+            print("\n    [Output] ", end="", flush=True)
+        print(subword, end="", flush=True)
         return False
 
     gen_start = time.perf_counter()
@@ -561,6 +393,7 @@ def run_scenario(
 
     total_time = gen_end - gen_start
     output_tokens = token_count
+    print("\n")  # newline after streamed output
 
     # Compute TTFT
     if first_token_time is not None:
@@ -650,10 +483,10 @@ def run_scenario(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_report(report: FullReport):
-    """Print the full report in a format comparable to ASUS data."""
+    """Print the full KPI report."""
     sep = "=" * 72
     print(f"\n{sep}")
-    print("  ASUS KPI COMPARISON REPORT")
+    print("  KPI BENCHMARK REPORT")
     print(sep)
     print(f"  Model          : {report.model_name}")
     print(f"  Model dir      : {report.model_dir}")
@@ -672,7 +505,7 @@ def print_report(report: FullReport):
     print(f"  Cache peak mem : {report.cache_info.cache_peak_memory_gb:.2f} GB")
     print()
 
-    # Table header matching ASUS format
+    # Table header
     hdr = (
         f"  {'Input tokens':>13} {'Output tokens':>14} "
         f"{'Prefill (t/s)':>14} {'Output TPS':>11} "
@@ -689,12 +522,13 @@ def print_report(report: FullReport):
 
     print()
     # Also print TTFT / TPOT details
-    print(f"  {'Scenario':>13} {'TTFT (ms)':>10} {'TPOT (ms)':>10} "
+    scn_w = max(8, max(len(s.scenario) for s in report.scenarios))  # dynamic width
+    print(f"  {'Scenario':>{scn_w}} {'TTFT (ms)':>10} {'TPOT (ms)':>10} "
           f"{'Prefill (t/s)':>14} {'Output TPS':>11}")
-    print("  " + "-" * 60)
+    print("  " + "-" * (scn_w + 10 + 10 + 14 + 11 + 4))
     for s in report.scenarios:
         print(
-            f"  {s.scenario:>13} {s.ttft_ms:>10.1f} {s.tpot_ms:>10.1f} "
+            f"  {s.scenario:>{scn_w}} {s.ttft_ms:>10.1f} {s.tpot_ms:>10.1f} "
             f"{s.prefill_speed_tps:>14.1f} {s.output_tps:>11.1f}"
         )
 
@@ -723,7 +557,7 @@ def save_report_json(report: FullReport, path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Gemma 4 E4B — ASUS KPI Comparison Benchmark",
+        description="Gemma 4 E4B — KPI Benchmark",
     )
     parser.add_argument(
         "--model-dir", required=True,
@@ -734,12 +568,12 @@ def main():
         help="Inference device (default: GPU)",
     )
     parser.add_argument(
-        "--scenarios", nargs="+", type=int, default=[467, 1058, 2075],
-        help="Target input token counts for each scenario (default: 467 1058 2075)",
+        "--prompt-file", nargs="+", required=True,
+        help="Path(s) to prompt text file(s). Each file is one scenario.",
     )
     parser.add_argument(
-        "--max-new-tokens", type=int, default=300,
-        help="Max output tokens per scenario (default: 300, enough for ASUS-style test)",
+        "--max-new-tokens", type=int, default=0,
+        help="Max output tokens per scenario (default: 0 = no limit, generate until EOS)",
     )
     parser.add_argument(
         "--no-mmap", action="store_true",
@@ -777,7 +611,7 @@ def main():
     genai_ver = getattr(ov_genai, "__version__", "unknown")
 
     print(f"{'='*72}")
-    print(f"  Gemma 4 E4B — ASUS KPI Comparison Benchmark")
+    print(f"  Gemma 4 E4B — KPI Benchmark")
     print(f"{'='*72}")
     print(f"  Date           : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  System memory  : {sys_mem_gb:.1f} GB")
@@ -787,8 +621,8 @@ def main():
     print(f"  CACHE_DIR      : {args.cache_dir or 'not set'}")
     print(f"  OpenVINO       : {ov_ver}")
     print(f"  openvino-genai : {genai_ver}")
-    print(f"  Scenarios      : {args.scenarios} tokens input")
-    print(f"  Max new tokens : {args.max_new_tokens}")
+    print(f"  Prompt files   : {args.prompt_file}")
+    print(f"  Max new tokens : {args.max_new_tokens if args.max_new_tokens > 0 else 'no limit'}")
     print(f"  Warmup runs    : {args.warmup}")
 
     model_size = get_model_size_gb(model_dir)
@@ -837,20 +671,17 @@ def main():
     report.model_load_time_s = load_time
     print(f"  Model loaded in {load_time:.1f}s (cache reuse), RSS={get_rss_gb():.2f} GB")
 
-    # ── Step 3: Build prompts for each scenario ─────────────────────────────
-    print(f"\n--- Building prompts for scenarios ---")
+    # ── Step 3: Load prompts from files ──────────────────────────────────────
+    print(f"\n--- Loading prompts from files ---")
     tokenizer_ref = ov_genai.Tokenizer(str(model_dir))
 
     scenario_prompts = []
-    for target_tokens in args.scenarios:
-        if target_tokens < 20:
-            # Very short prompt
-            prompt = "Hello, how are you?"
-            actual = len(tokenizer_ref.encode(prompt).input_ids.data.flatten().tolist())
-        else:
-            prompt, actual = build_prompt_with_target_tokens(tokenizer_ref, target_tokens)
-        scenario_prompts.append((f"~{target_tokens}", prompt, actual))
-        print(f"  Scenario ~{target_tokens} tokens -> actual {actual} tokens")
+    for pf in args.prompt_file:
+        prompt = load_prompt_file(pf)
+        actual = tokenize_prompt(tokenizer_ref, prompt)
+        name = Path(pf).stem  # filename without extension as scenario name
+        scenario_prompts.append((name, prompt, actual))
+        print(f"  {name}: {actual} input tokens  ({pf})")
 
     # ── Step 4: Warmup ──────────────────────────────────────────────────────
     if args.warmup > 0:

@@ -631,3 +631,194 @@ python benchmark_asus_kpi.py `
 - [x] ASUS comparison analysis — done
 - [ ] 4K I/O extended test
 - [ ] Internal ticket filed (if gaps confirmed)
+---
+
+## Step 9: GPU Plugin Integration — Dense Weight Streaming
+
+**Date:** 2026-05-XX  
+**Goal:** Integrate `DenseWeightStreamingManager` into the real OpenVINO GPU plugin and validate end-to-end with VLMPipeline.
+
+### Approach
+
+The key challenge: our streaming code was developed against OpenVINO HEAD, but the pip-installed runtime is from a specific commit (`9c4a2eb9ad3`). Building openvino.dll from HEAD causes ABI incompatibility with pip's CPU plugin (needed for tokenizer in VLMPipeline).
+
+**Solution:** Build from the exact pip commit, patch only the GPU plugin, keep pip's openvino.dll + CPU plugin untouched.
+
+### Patches Applied (4 files)
+
+| File | Changes | Lines |
+|---|---|---:|
+| `network.hpp` | Forward decl, streaming methods, private members | +40 |
+| `network.cpp` | `execute_impl` hook, streamed execution pipeline | +154 |
+| `primitive_inst.h` | `force_set_output_memory()` inline method | +16 |
+| `CMakeLists.txt` | `OV_DENSE_WEIGHT_STREAMING_ENABLED` define + `winmm.lib` | +7 |
+
+Plus deployment of `dense_weight_streaming_manager.hpp/.cpp` into the GPU graph source tree.
+
+### Build Configuration
+
+```
+Git commit: 9c4a2eb9ad3 (matches pip openvino==2026.2.0.dev20260411)
+CI_BUILD_NUMBER: 2026.2.0-21571-9c4a2eb9ad3
+ENABLE_INTEL_GPU: ON
+ENABLE_INTEL_CPU: OFF (only GPU plugin built)
+BUILD_SHARED_LIBS: ON
+```
+
+### Results
+
+1. **Build:** `openvino_intel_gpu_plugin.dll` (34.2 MB) built successfully with zero errors
+2. **DLL Swap:** Only GPU plugin DLL replaced in pip's `openvino\libs\` directory
+3. **Device Check:** `['CPU', 'GPU', 'NPU']` — all devices available, version matches
+
+4. **Baseline Test (no streaming):**
+   ```
+   Prompt: "What is 2+2? Answer briefly."
+   Output: "4"
+   Generation time: 0.82s
+   Status: PASS ✅
+   ```
+
+5. **Streaming Trigger Test (with dummy file):**
+   ```
+   OV_DENSE_STREAM_WEIGHTS=dummy_path.bin
+   [DenseStreaming] Initializing from dummy_path.bin
+   [DenseStreaming] Cannot open file: dummy_path.bin
+   [DenseStreaming] Failed to initialize!
+   → Graceful fallback to normal inference
+   Output: "Hello! How can I help you today?"
+   Status: PASS ✅ (streaming path triggered, graceful fallback works)
+   ```
+
+### Key Files
+
+- **Built DLL:** `C:\working\gemma4-openvino\openvino\bin\intel64\Release\openvino_intel_gpu_plugin.dll`
+- **Pip target:** `C:\Users\Local_Admin\AppData\Local\Programs\Python\Python312\Lib\site-packages\openvino\libs\`
+- **Original backup:** `temp\pip_original\openvino_intel_gpu_plugin.dll`
+- **Patch diff:** `temp\streaming_patches.diff`
+
+### Lessons Learned
+
+1. **ONLY replace the GPU plugin DLL** — never replace `openvino.dll` (ABI break with CPU plugin)
+2. **Must build from exact pip commit** — even matching version strings isn't enough if source differs
+3. **`CI_BUILD_NUMBER` env var** controls the version string in the built DLL
+4. **Pip install source:** `pip install openvino==2026.2.0.dev20260411 --pre --extra-index-url https://storage.openvinotoolkit.org/simple/wheels/nightly`
+
+### Next Steps
+
+- [x] Generate real `dense_weights_streaming.bin` with `pack_dense_weights.py` 
+- [x] End-to-end streaming test with actual weight data
+- [x] Performance measurement: streaming TPS vs baseline
+- [ ] Memory reduction validation on 8 GB system
+
+---
+
+## Step 9b — Streamed Execution Path Integration (continued)
+
+**Date:** 2026-05-0X (continued session)
+
+### Objective
+
+Enable the `execute_impl_streamed()` execution path inside the GPU plugin so that
+each token's inference is split by decoder layer group, with group transition
+detection for future weight swapping.
+
+### Bugs Fixed This Session
+
+#### 1. `_optimized_` Primitive Crash (from prev session)
+- **Root cause:** `get_all_primitive_ids()` returns IDs like `_optimized_` that throw when `get_primitive()` is called
+- **Fix:** Use `_exec_order.size()` for primitive count, try-catch around `get_primitive()` in `build_weight_mapping()`
+
+#### 2. Layer Table Index Mismatch (from prev session)
+- **Root cause:** Python packer wrote entries at model index (5–36), C++ reader expected packed index (0–31)  
+- **Fix:** `packed_idx = layer_idx - first_streamed` in `pack_dense_weights.py`
+
+#### 3. Dynamic Shape Crash: `[GPU] Count is called for dynamic shape`
+- **Root cause:** Original `execute_impl_streamed()` was missing `set_arguments()` call and per-primitive `reset_events()`. VLMPipeline uses dynamic shapes (PagedAttention), which require proper argument setup.
+- **Fix (Phase 1):** Mirror the normal `execute_impl()` loop exactly — `set_arguments()` → per-primitive `reset_events()` + `add_dep_events()` + `prepare_primitive()` + `execute()` + dynamic flushing (every 16 prims).
+
+#### 4. **Group Partitioning Order Mismatch** (KEY DISCOVERY)
+- **Root cause:** `_exec_order` is a **topological sort**, not a layer-sequential order. The GPU compiler interleaves constant operations from different layers (e.g., `layers.5.self_attn/Unsqueeze` appears before `layers.0.input_layernorm`). Our original `build_group_exec_order()` sorted primitives into group-specific lists, then concatenated them — this produced an order with **2532 mismatches** vs `_exec_order`.
+- **Impact:** Group-concatenated execution crashed because primitives depended on outputs from primitives that were in different groups.
+- **Fix:** **Linear + Annotation approach** — iterate `_exec_order` in its original topological order, use a per-primitive `m_exec_group_assignment` vector to annotate which group each primitive belongs to. Group transitions are detected on-the-fly, not by reordering.
+- **Validation:** After fix, execution with streaming path produces correct output and **zero performance overhead** (23.4 tps vs 23.4 tps baseline).
+
+### Architecture: Linear + Group Annotation
+
+```
+Normal execute_impl():
+  set_arguments() → for each prim in _exec_order: execute()
+
+Streamed execute_impl_streamed() (Phase 1 — no weight swap):
+  set_arguments()
+  for each prim in _exec_order:
+    group = m_exec_group_assignment[idx]
+    if entering new streamed group:
+      [FUTURE: load_group(g), swap_weight_pointers(g)]
+    prim->reset_events() → prepare_primitive() → execute()
+    dynamic flushing every 16 prims
+
+Phase 2 (FUTURE — actual weight streaming):
+  Same loop, but at group transitions:
+    1. wait_for_gpu()           // ensure previous group finished
+    2. wait_for_load(g)         // ensure NVMe→USM DMA complete
+    3. swap_weight_pointers(g)  // redirect data primitives to buffer
+    4. prefetch_next_group(g+1) // start async load for next group
+```
+
+### Group Assignment Constants
+```
+GROUP_PRE_DECODER = -3     // embeddings, vision encoder
+GROUP_PINNED_HEAD = -2     // layers 0-4 (always in memory)
+GROUP_PINNED_TAIL = -1     // layers 37-41 (always in memory)
+0..31                      // streamed middle groups
+32 (num_groups)            // post-decoder (final norm, lm_head)
+```
+
+### Network Primitive Statistics
+```
+Total primitives: 2549
+Pre-decoder:      6        (3 networks: 19+4+2549 prims)
+Pinned HEAD:      555      (layers 0-4 + interleaved shared ops)
+Middle groups:    40-70/group × 32 groups
+Pinned TAIL:      204      (layers 37-41 + shared ops)
+Post-decoder:     10       (final norm, lm_head, logits)
+```
+
+### Weight Mapping Statistics
+```
+Total constants:     1238
+Decoder constants:    588  (in layers.0-41)
+Streamed constants:   448  (in layers 5-36)
+Tensors per layer:     14
+```
+
+### Performance Comparison (50 tokens, same prompt)
+| Path | TPS | Time | Overhead |
+|---|---:|---:|---|
+| Normal `execute_impl()` | 23.4 | 2.14s | — |
+| Streamed `execute_impl_streamed()` | 23.4 | 2.13s | **0%** ✅ |
+
+### Files Modified This Session
+
+| File | Location | Change |
+|---|---|---|
+| `dense_weight_streaming_manager.hpp` | workspace `cpp/` + deployed | Added `m_exec_group_assignment`, `GROUP_*` constants, `exec_group_assignments()` getter |
+| `dense_weight_streaming_manager.cpp` | workspace `cpp/` + deployed | Rewrote `build_group_exec_order()`: 2-pass algorithm with `current_layer` region tracking, builds `m_exec_group_assignment` parallel to `_exec_order` |
+| `network.cpp` | OpenVINO source only | `execute_impl_streamed()`: linear iteration with group annotation, `set_arguments()` + dynamic flushing; `execute_impl()`: enabled streaming path redirect |
+| `pack_dense_weights.py` | workspace root | Fixed layer table packed index alignment |
+
+### Backup State
+
+- **Original pip DLLs:** `temp\pip_original\`
+- **Model cache backup:** `temp\model_cache_backup\`
+- **Build logs:** `temp\build_gpu*.log`
+- **Test logs:** `temp\test_streaming*.log` (15+ iterations)
+
+### Next Steps
+
+- [ ] Phase 2: Enable actual weight swapping via `swap_weight_pointers()` at group transitions
+- [ ] Validate packed binary data matches GPU weight format (byte-level comparison)
+- [ ] Memory reduction test: deallocate streamed layer weights, measure RSS savings
+- [ ] NVMe→USM Direct I/O streaming benchmark with double-buffered pipeline
+- [ ] Full 8 GB system validation

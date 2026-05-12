@@ -69,10 +69,14 @@ void DenseStreamingConfig::read_from_env() {
         enable_timing = (std::string(v) == "1");
     if (const char* v = std::getenv("OV_DENSE_STREAM_DEBUG"))
         debug_logging = (std::string(v) == "1");
+    if (const char* v = std::getenv("OV_DENSE_STREAM_LOG_FILE"))
+        debug_log_path = v;
     if (const char* v = std::getenv("OV_DENSE_STREAM_MAX_BUFFER_GB")) {
         double gb = std::stod(v);
         max_buffer_bytes = static_cast<uint64_t>(gb * 1024.0 * 1024.0 * 1024.0);
     }
+    if (const char* v = std::getenv("OV_DENSE_STREAM_NUM_BUFFERS"))
+        num_buffers = std::clamp(static_cast<uint32_t>(std::stoul(v)), 2u, 4u);
     // Hybrid pinning: number of head/tail layers to keep permanently in memory
     if (const char* v = std::getenv("OV_DENSE_STREAM_PIN_HEAD"))
         pin_head_layers = std::clamp(static_cast<uint32_t>(std::stoul(v)), 0u, total_decoder_layers);
@@ -117,6 +121,77 @@ void DenseStreamingStats::print_summary() const {
 }
 
 // ============================================================================
+// Token Timing Recording
+// ============================================================================
+
+void DenseWeightStreamingManager::record_token_timing(const TokenTimingRecord& record) {
+    m_token_timings.push_back(record);
+}
+
+void DenseWeightStreamingManager::flush_token_timings() {
+    FILE* f = m_debug_log ? m_debug_log : stderr;
+    
+    if (m_token_timings.empty()) return;
+    
+    fprintf(f, "\n============================================================\n");
+    fprintf(f, "  Dense Weight Streaming — Per-Token Timing Summary\n");
+    fprintf(f, "  Total tokens: %zu\n", m_token_timings.size());
+    fprintf(f, "============================================================\n");
+    fprintf(f, "%6s %9s %8s %8s %8s %8s %8s %6s\n",
+            "Token", "Total_ms", "Load_ms", "Swap_ms", "Args_ms",
+            "Flush_ms", "GPU_ms", "Groups");
+    
+    // Aggregates
+    double sum_total = 0, sum_load = 0, sum_swap = 0;
+    double sum_args = 0, sum_flush = 0, sum_gpu = 0;
+    
+    for (const auto& t : m_token_timings) {
+        fprintf(f, "%6u %9.2f %8.2f %8.2f %8.2f %8.2f %8.2f %6u\n",
+                t.token_idx, t.total_ms, t.load_ms, t.swap_ms,
+                t.set_args_ms, t.flush_ms, t.gpu_compute_ms, t.group_transitions);
+        sum_total += t.total_ms;
+        sum_load += t.load_ms;
+        sum_swap += t.swap_ms;
+        sum_args += t.set_args_ms;
+        sum_flush += t.flush_ms;
+        sum_gpu += t.gpu_compute_ms;
+    }
+    
+    size_t n = m_token_timings.size();
+    fprintf(f, "------------------------------------------------------------\n");
+    fprintf(f, "%6s %9.2f %8.2f %8.2f %8.2f %8.2f %8.2f\n",
+            "AVG", sum_total/n, sum_load/n, sum_swap/n,
+            sum_args/n, sum_flush/n, sum_gpu/n);
+    fprintf(f, "%6s %9.2f %8.2f %8.2f %8.2f %8.2f %8.2f\n",
+            "TOTAL", sum_total, sum_load, sum_swap,
+            sum_args, sum_flush, sum_gpu);
+    fprintf(f, "------------------------------------------------------------\n");
+    fprintf(f, "  Avg TPOT: %.2f ms → %.2f tok/s\n",
+            sum_total / n, 1000.0 * n / sum_total);
+    fprintf(f, "  Overhead breakdown (avg per token):\n");
+    fprintf(f, "    NVMe load:     %6.2f ms (%5.1f%%)\n", sum_load/n, 100.0*sum_load/sum_total);
+    fprintf(f, "    Swap pointers: %6.2f ms (%5.1f%%)\n", sum_swap/n, 100.0*sum_swap/sum_total);
+    fprintf(f, "    set_arguments: %6.2f ms (%5.1f%%)\n", sum_args/n, 100.0*sum_args/sum_total);
+    fprintf(f, "    GPU fence:     %6.2f ms (%5.1f%%)\n", sum_flush/n, 100.0*sum_flush/sum_total);
+    fprintf(f, "    GPU compute:   %6.2f ms (%5.1f%%)\n", sum_gpu/n, 100.0*sum_gpu/sum_total);
+    fprintf(f, "============================================================\n\n");
+    fflush(f);
+    
+    if (m_debug_log) {
+        // Also print brief summary to stderr
+        fprintf(stderr, "[DenseStreaming] Token timing logged to: %s\n",
+                m_config.debug_log_path.c_str());
+        fprintf(stderr, "[DenseStreaming] %zu tokens, avg %.2f ms/tok (%.2f tok/s)\n",
+                n, sum_total/n, 1000.0*n/sum_total);
+        fprintf(stderr, "[DenseStreaming] Breakdown: load=%.1f%% swap=%.1f%% "
+                "args=%.1f%% flush=%.1f%% gpu=%.1f%%\n",
+                100.0*sum_load/sum_total, 100.0*sum_swap/sum_total,
+                100.0*sum_args/sum_total, 100.0*sum_flush/sum_total,
+                100.0*sum_gpu/sum_total);
+    }
+}
+
+// ============================================================================
 // DenseWeightStreamingManager — Constructor / Destructor
 // ============================================================================
 
@@ -124,9 +199,32 @@ DenseWeightStreamingManager::DenseWeightStreamingManager(cldnn::engine& engine,
                                                            const DenseStreamingConfig& config)
     : m_engine(engine)
     , m_config(config) {
+    // Open debug log file if specified
+    if (!m_config.debug_log_path.empty()) {
+        m_debug_log = fopen(m_config.debug_log_path.c_str(), "w");
+        if (m_debug_log) {
+            fprintf(m_debug_log, "=== Dense Weight Streaming Debug Log ===\n");
+            fprintf(m_debug_log, "Timestamp: %s\n", __TIMESTAMP__);
+            fflush(m_debug_log);
+        } else {
+            std::cerr << "[DenseStreaming] WARNING: Cannot open log file: "
+                      << m_config.debug_log_path << ", using stderr\n";
+        }
+    }
 }
 
 DenseWeightStreamingManager::~DenseWeightStreamingManager() {
+    // Flush token timing summary before shutdown
+    if (!m_token_timings.empty()) {
+        flush_token_timings();
+    }
+    
+    // Close debug log file
+    if (m_debug_log) {
+        fclose(m_debug_log);
+        m_debug_log = nullptr;
+    }
+    
     // Join any in-flight prefetch thread
     join_prefetch_thread();
     
@@ -134,7 +232,7 @@ DenseWeightStreamingManager::~DenseWeightStreamingManager() {
     shutdown_io();
     
     // Free USM buffers
-    for (int i = 0; i < NUM_BUFFERS; ++i) {
+    for (int i = 0; i < m_num_buffers; ++i) {
 #ifdef OPENVINO_GPU_RUNTIME_AVAILABLE
         // Real integration: release the cldnn::memory handle (shared_ptr)
         m_buffers[i].reset();
@@ -310,8 +408,10 @@ bool DenseWeightStreamingManager::allocate_buffers() {
         // Still allocate — can't reduce group size at runtime
     }
     
-    // Allocate two buffers (double-buffer)
-    for (int i = 0; i < NUM_BUFFERS; ++i) {
+    // Allocate buffers (2-4, configurable)
+    m_num_buffers = static_cast<int>(std::min(m_config.num_buffers,
+                                               static_cast<uint32_t>(MAX_BUFFERS)));
+    for (int i = 0; i < m_num_buffers; ++i) {
         m_buffer_sizes[i] = max_group_bytes;
 
 #ifdef OPENVINO_GPU_RUNTIME_AVAILABLE
@@ -355,7 +455,7 @@ bool DenseWeightStreamingManager::allocate_buffers() {
     }
     
     if (m_config.debug_logging) {
-        std::cout << "[DenseStreaming] Allocated 2 × " 
+        std::cout << "[DenseStreaming] Allocated " << m_num_buffers << " × " 
                   << (max_group_bytes / (1024.0*1024.0)) << " MB USM buffers\n";
     }
     
@@ -436,6 +536,29 @@ void DenseWeightStreamingManager::shutdown_io() {
 }
 
 // ============================================================================
+// Runtime: Buffer Management
+// ============================================================================
+
+int DenseWeightStreamingManager::find_free_buffer(uint32_t exclude_group) const {
+    // Priority: prefer empty buffer (-1), then oldest non-active non-excluded
+    int best = -1;
+    for (int i = 0; i < m_num_buffers; ++i) {
+        if (i == m_active_buffer) continue;  // don't touch GPU's active buffer
+        if (m_buffer_group[i] == -1) return i;  // empty → immediate use
+        if (exclude_group != UINT32_MAX && 
+            m_buffer_group[i] == static_cast<int32_t>(exclude_group)) continue;
+        best = i;  // reusable (overwrite stale data)
+    }
+    // Fallback: if all non-active buffers hold needed groups, pick any non-active
+    if (best < 0) {
+        for (int i = 0; i < m_num_buffers; ++i) {
+            if (i != m_active_buffer) { best = i; break; }
+        }
+    }
+    return best;
+}
+
+// ============================================================================
 // Runtime: Weight Loading
 // ============================================================================
 
@@ -451,7 +574,7 @@ bool DenseWeightStreamingManager::load_group(uint32_t group_idx) {
     join_prefetch_thread();
     
     // Check if this group is already loaded in one of the buffers
-    for (int i = 0; i < NUM_BUFFERS; ++i) {
+    for (int i = 0; i < m_num_buffers; ++i) {
         if (m_buffer_group[i] == static_cast<int32_t>(group_idx)) {
             if (m_config.debug_logging) {
                 std::cout << "[DenseStreaming] load_group(" << group_idx 
@@ -461,8 +584,8 @@ bool DenseWeightStreamingManager::load_group(uint32_t group_idx) {
         }
     }
     
-    // Determine which buffer to load into (the inactive one)
-    int load_buffer = 1 - m_active_buffer;
+    // Determine which buffer to load into (find a free non-active buffer)
+    int load_buffer = find_free_buffer();
     
     const auto& group = m_group_table[group_idx];
     void* dest = m_buffer_ptrs[load_buffer];
@@ -520,7 +643,7 @@ bool DenseWeightStreamingManager::wait_for_load(uint32_t group_idx) {
     
     // Find which buffer has this group
     int target_buffer = -1;
-    for (int i = 0; i < NUM_BUFFERS; ++i) {
+    for (int i = 0; i < m_num_buffers; ++i) {
         if (m_buffer_group[i] == static_cast<int32_t>(group_idx)) {
             target_buffer = i;
             break;
@@ -546,7 +669,7 @@ bool DenseWeightStreamingManager::prefetch_next_group(uint32_t next_group_idx) {
     join_prefetch_thread();
     
     // Check if already loaded
-    for (int i = 0; i < NUM_BUFFERS; ++i) {
+    for (int i = 0; i < m_num_buffers; ++i) {
         if (m_buffer_group[i] == static_cast<int32_t>(next_group_idx)) {
             if (m_config.debug_logging) {
                 std::cout << "[DenseStreaming] prefetch_next_group(" << next_group_idx
@@ -560,8 +683,12 @@ bool DenseWeightStreamingManager::prefetch_next_group(uint32_t next_group_idx) {
     m_prefetch_group_idx = next_group_idx;
     m_prefetch_success.store(false);
     
-    // Load into inactive buffer (does not conflict with active buffer GPU reads)
-    int prefetch_buffer = 1 - m_active_buffer;
+    // Load into a free buffer (does not conflict with active buffer GPU reads)
+    int prefetch_buffer = find_free_buffer();
+    if (prefetch_buffer < 0) {
+        std::cerr << "[DenseStreaming] prefetch: no free buffer available!\n";
+        return false;
+    }
     const auto& group = m_group_table[next_group_idx];
     void* dest = m_buffer_ptrs[prefetch_buffer];
     
@@ -626,7 +753,7 @@ void DenseWeightStreamingManager::join_prefetch_thread() {
 
 void* DenseWeightStreamingManager::get_group_buffer_ptr(uint32_t group_idx) const {
     // Find which buffer holds this group
-    for (int i = 0; i < NUM_BUFFERS; ++i) {
+    for (int i = 0; i < m_num_buffers; ++i) {
         if (m_buffer_group[i] == static_cast<int32_t>(group_idx)) {
             return m_buffer_ptrs[i];
         }
@@ -805,7 +932,7 @@ bool DenseWeightStreamingManager::build_weight_mapping(void* network_ptr) {
         std::cout << "  Constants found: " << total_constants << " total, "
                   << decoder_constants << " decoder, "
                   << streamed_constants << " in streamed range\n";
-        // Dump sample primitive names to a file for debugging
+        // Enhanced debug: dump FC dependencies + large unnamed constants
         {
             std::string dbg_path = m_config.weights_file_path;
             auto dpos = dbg_path.rfind('\\');
@@ -813,16 +940,79 @@ bool DenseWeightStreamingManager::build_weight_mapping(void* network_ptr) {
             if (dpos != std::string::npos) dbg_path = dbg_path.substr(0, dpos+1);
             else dbg_path = "";
             dbg_path += "debug_primitives.txt";
-            std::ofstream dbg(dbg_path);
-            if (dbg.is_open()) {
+            FILE* dbg = fopen(dbg_path.c_str(), "w");
+            if (dbg) {
+                // Section 1: per-layer data primitives (existing)
                 for (uint32_t l = 0; l < std::min<uint32_t>(2, m_header.num_layers); ++l) {
-                    dbg << "--- Packed layer " << l << " (model layer " 
-                        << (first_streamed + l) << ") ---\n";
+                    fprintf(dbg, "--- Packed layer %u (model layer %u) ---\n", l, first_streamed + l);
                     for (const auto& t : per_layer_tensors[l]) {
-                        dbg << "  " << t.name << " (" << t.size_bytes << " bytes)\n";
+                        fprintf(dbg, "  %s (%llu bytes)\n", t.name.c_str(), (unsigned long long)t.size_bytes);
                     }
                 }
-                dbg.close();
+                
+                // Section 2: ALL constants > 100KB that DON'T have "layers." in name
+                fprintf(dbg, "\n=== Large constants WITHOUT 'layers.' in name (>100KB) ===\n");
+                uint64_t unnamed_total = 0;
+                uint32_t unnamed_count = 0;
+                for (const auto& id : all_ids) {
+                    cldnn::primitive_inst* prim = nullptr;
+                    try { prim = net->get_primitive(id).get(); } catch (...) { continue; }
+                    if (!prim || !prim->is_constant() || prim->inputs_memory_count() > 0) continue;
+                    if (id.find("layers.") != std::string::npos) continue; // skip ones we already found
+                    auto mem = prim->output_memory_ptr(0);
+                    if (!mem) continue;
+                    uint64_t sz = mem->size();
+                    if (sz >= 100*1024) {
+                        fprintf(dbg, "  [%llu bytes = %.2f MB] %s\n", 
+                                (unsigned long long)sz, sz / (1024.0*1024.0), id.c_str());
+                        unnamed_total += sz;
+                        ++unnamed_count;
+                    }
+                }
+                fprintf(dbg, "  Total: %u constants, %llu bytes = %.1f MB\n",
+                        unnamed_count, (unsigned long long)unnamed_total, unnamed_total / (1024.0*1024.0));
+                
+                // Section 3: Large constants WITH "layers." but inputs_memory_count > 0 
+                fprintf(dbg, "\n=== Constants with 'layers.' but inputs_memory_count > 0 ===\n");
+                for (const auto& id : all_ids) {
+                    if (id.find("layers.") == std::string::npos) continue;
+                    cldnn::primitive_inst* prim = nullptr;
+                    try { prim = net->get_primitive(id).get(); } catch (...) { continue; }
+                    if (!prim || !prim->is_constant()) continue;
+                    if (prim->inputs_memory_count() == 0) continue; // already counted
+                    auto mem = prim->output_memory_ptr(0);
+                    uint64_t sz = mem ? mem->size() : 0;
+                    fprintf(dbg, "  [inputs=%zu, %llu bytes] %s\n", 
+                            prim->inputs_memory_count(), (unsigned long long)sz, id.c_str());
+                }
+                
+                // Section 4: FC dependencies for layer 5
+                fprintf(dbg, "\n=== FC primitive dependencies for layers.5 ===\n");
+                std::string fc_marker = "fullyconnectedcompressed:__module.model.language_model.layers.5.";
+                for (const auto& id : all_ids) {
+                    if (id.find(fc_marker) == std::string::npos) continue;
+                    cldnn::primitive_inst* fc = nullptr;
+                    try { fc = net->get_primitive(id).get(); } catch (...) { continue; }
+                    if (!fc) continue;
+                    fprintf(dbg, "\nFC: %s\n", id.c_str());
+                    fprintf(dbg, "  is_dynamic: %d\n", fc->is_dynamic() ? 1 : 0);
+                    auto& deps = fc->dependencies();
+                    fprintf(dbg, "  dependencies count: %zu\n", deps.size());
+                    for (size_t d = 0; d < deps.size(); ++d) {
+                        auto* dep_inst = deps[d].first;
+                        int32_t dep_out_idx = deps[d].second;
+                        auto dep_mem = dep_inst->output_memory_ptr(dep_out_idx);
+                        uint64_t dep_sz = dep_mem ? dep_mem->size() : 0;
+                        fprintf(dbg, "  dep[%zu]: (out_idx=%d) [%llu bytes = %.2f MB] is_const=%d inputs=%zu id=%s\n",
+                                d, dep_out_idx, (unsigned long long)dep_sz, dep_sz/(1024.0*1024.0),
+                                dep_inst->is_constant() ? 1 : 0,
+                                dep_inst->inputs_memory_count(),
+                                dep_inst->id().c_str());
+                    }
+                }
+                
+                fclose(dbg);
+                std::cout << "  Debug written to: " << dbg_path << "\n";
             }
         }
     }
@@ -913,25 +1103,26 @@ bool DenseWeightStreamingManager::build_weight_mapping(void* network_ptr) {
 bool DenseWeightStreamingManager::build_weight_mapping_from_json(
     const std::string& json_metadata_path, void* network_ptr) {
     // ====================================================================
-    // Read per-tensor metadata from JSON and cross-reference with network
+    // FC-SCAN APPROACH: Build weight mapping from FC primitive dependencies
     // ====================================================================
     //
-    // The JSON file (produced by pack_dense_weights.py) contains:
-    //   "layers": [
-    //     {
-    //       "layer_idx": 0,
-    //       "tensors": [
-    //         {"name": "__module.model.layers.0.self_attn.q_proj.weight",
-    //          "size_bytes": 12345, "dtype": "i4", "shape": [2048, 256]},
-    //         ...
-    //       ]
-    //     },
-    //     ...
-    //   ]
+    // Strategy:
+    //   1. Parse JSON to build per-layer offset table (tensor name → offset)
+    //   2. Scan compiled network for fullyconnectedcompressed primitives
+    //   3. For each dynamic FC in streamed layers:
+    //      - Extract component name from FC ID (e.g. "mlp.gate_proj")
+    //      - Find dep[1] (weight), dep[2] (scale), dep[3] (zp)
+    //      - Match dep sizes against JSON tensor sizes
+    //      - If match: create mapping entry with correct byte offset
     //
-    // The tensor ORDER in the JSON matches the packing order in the binary.
-    // This is the authoritative source for offset_in_layer calculations.
+    // Why FC-scan instead of data-primitive-scan?
+    //   - INT4 weight deps have names like "Constant_135971" (no "layers.")
+    //   - scale/zp deps have reorder names that don't match JSON names
+    //   - Only the FC primitive itself has "layers.N" in its name
+    //   - Dynamic FCs use _reordered_weights_cache, not dep_memory_ptr(1)
+    //     directly, so we need to update the cache too
     
+    // Step 1: Parse JSON for per-layer tensor offset tables
     std::ifstream json_file(json_metadata_path);
     if (!json_file.is_open()) {
         std::cerr << "[DenseStreaming] Cannot open JSON metadata: " 
@@ -939,148 +1130,218 @@ bool DenseWeightStreamingManager::build_weight_mapping_from_json(
         return false;
     }
     
-    // Simple JSON parsing for our specific format
-    // (In production, use a proper JSON library like nlohmann::json)
     std::string json_content((std::istreambuf_iterator<char>(json_file)),
                               std::istreambuf_iterator<char>());
     json_file.close();
     
-    m_weight_mappings.clear();
-    
-    // Parse layer-by-layer tensor info using string search
-    // Format we're looking for:
-    //   "layer_idx": N,       (N = model layer index, e.g. 5..36)
-    //   "tensors": [{"name": "...", "size_bytes": NN, ...}, ...]
-    //
-    // IMPORTANT: The JSON uses MODEL layer indices (0..41 for all decoder layers).
-    // The packed file header's num_layers is the count of STREAMED layers (e.g. 32).
-    // We must search for the model layer index (first_streamed + packed_idx),
-    // but store the packed index (0-based) in mapping.layer_idx.
-    
     const uint32_t first_streamed = m_group_table[0].first_layer;
     
+    // Build lookup: per packed layer, map partial name → (offset, size)
+    // e.g. "mlp.gate_proj.weight" → (offset=72, size=13107200)
+    struct TensorOffset {
+        uint64_t offset_in_layer;
+        uint64_t size_bytes;
+        std::string full_name;
+    };
+    // Key: partial name after "layers.N." (e.g. "mlp.gate_proj.weight")
+    // Value: offset info
+    std::vector<std::unordered_map<std::string, TensorOffset>> layer_offset_tables(
+        m_header.num_layers);
+    
     for (uint32_t layer = 0; layer < m_header.num_layers; ++layer) {
-        // Map packed index to model layer index
         uint32_t model_layer = first_streamed + layer;
-        
-        // Find the layer section in JSON using model layer index
-        // Use trailing comma to avoid false matches (e.g. "layer_idx": 5 vs 50)
         std::string layer_marker = "\"layer_idx\": " + std::to_string(model_layer) + ",";
         size_t layer_pos = json_content.find(layer_marker);
         if (layer_pos == std::string::npos) continue;
         
-        // Find the "tensors" array start for this layer
         size_t tensors_pos = json_content.find("\"tensors\":", layer_pos);
         if (tensors_pos == std::string::npos) continue;
-        
-        // Find the closing ']' of the tensors array
         size_t array_start = json_content.find('[', tensors_pos);
         if (array_start == std::string::npos) continue;
         
-        // Parse individual tensor objects
         uint64_t offset_in_layer = 0;
         size_t search_pos = array_start;
         
+        // Prefix to strip: "self.model.language_model.layers.N."
+        std::string prefix = "self.model.language_model.layers." 
+                           + std::to_string(model_layer) + ".";
+        
         while (true) {
-            // Find next tensor object start
             size_t obj_start = json_content.find('{', search_pos);
             if (obj_start == std::string::npos) break;
-            
-            // Check if we've passed the end of the tensors array
             size_t next_bracket = json_content.find(']', search_pos);
             if (next_bracket != std::string::npos && next_bracket < obj_start) break;
-            
             size_t obj_end = json_content.find('}', obj_start);
             if (obj_end == std::string::npos) break;
             
             std::string obj = json_content.substr(obj_start, obj_end - obj_start + 1);
             
-            // Extract "name"
             std::string tensor_name;
             size_t name_pos = obj.find("\"name\":");
             if (name_pos != std::string::npos) {
-                size_t quote1 = obj.find('"', name_pos + 7);
-                size_t quote2 = obj.find('"', quote1 + 1);
-                if (quote1 != std::string::npos && quote2 != std::string::npos) {
-                    tensor_name = obj.substr(quote1 + 1, quote2 - quote1 - 1);
-                }
+                size_t q1 = obj.find('"', name_pos + 7);
+                size_t q2 = obj.find('"', q1 + 1);
+                if (q1 != std::string::npos && q2 != std::string::npos)
+                    tensor_name = obj.substr(q1 + 1, q2 - q1 - 1);
             }
             
-            // Extract "size_bytes"
             uint64_t size_bytes = 0;
-            size_t size_pos = obj.find("\"size_bytes\":");
-            if (size_pos != std::string::npos) {
-                size_t num_start = size_pos + 13;
-                while (num_start < obj.size() && !std::isdigit(obj[num_start]))
-                    ++num_start;
-                if (num_start < obj.size()) {
-                    size_bytes = std::stoull(obj.substr(num_start));
-                }
+            size_t sz_pos = obj.find("\"size_bytes\":");
+            if (sz_pos != std::string::npos) {
+                size_t ns = sz_pos + 13;
+                while (ns < obj.size() && !std::isdigit(obj[ns])) ++ns;
+                if (ns < obj.size()) size_bytes = std::stoull(obj.substr(ns));
             }
             
             if (!tensor_name.empty() && size_bytes > 0) {
-                WeightTensorMapping mapping;
-                mapping.layer_idx = layer;
-                mapping.tensor_name = tensor_name;
-                mapping.primitive_id = tensor_name;  // Default: same as name
-                mapping.offset_in_layer = offset_in_layer;
-                mapping.size_bytes = size_bytes;
-                
-                m_weight_mappings.push_back(std::move(mapping));
+                // Extract partial name (after "self.model.language_model.layers.N.")
+                std::string partial;
+                if (tensor_name.find(prefix) == 0) {
+                    partial = tensor_name.substr(prefix.size());
+                }
+                if (!partial.empty()) {
+                    layer_offset_tables[layer][partial] = {offset_in_layer, size_bytes, tensor_name};
+                }
                 offset_in_layer += size_bytes;
             }
-            
             search_pos = obj_end + 1;
         }
     }
     
-    // Cross-reference with compiled network (if available) to verify primitive IDs
+    if (m_config.debug_logging) {
+        std::cout << "[DenseStreaming] JSON offset tables built: "
+                  << layer_offset_tables[0].size() << " entries for layer 0\n";
+    }
+    
+    // Step 2: Scan FC primitives and build mapping
+    m_weight_mappings.clear();
+    
 #ifdef OPENVINO_GPU_RUNTIME_AVAILABLE
-    if (network_ptr) {
-        auto* net = static_cast<cldnn::network*>(network_ptr);
-        auto all_ids = net->get_all_primitive_ids();
-        std::unordered_set<std::string> prim_id_set(all_ids.begin(), all_ids.end());
+    if (!network_ptr) return false;
+    auto* net = static_cast<cldnn::network*>(network_ptr);
+    auto all_ids = net->get_all_primitive_ids();
+    
+    uint32_t fc_found = 0, weight_mapped = 0, scale_mapped = 0, zp_mapped = 0;
+    uint32_t weight_skipped = 0, scale_skipped = 0;
+    
+    // Pattern: "fullyconnectedcompressed:__module.model.language_model.layers.N."
+    const std::string fc_prefix = "fullyconnectedcompressed:__module.model.language_model.layers.";
+    
+    for (const auto& id : all_ids) {
+        if (id.find(fc_prefix) != 0) continue;  // Not an FC primitive
         
-        uint32_t matched = 0, unmatched = 0;
-        for (auto& mapping : m_weight_mappings) {
-            if (prim_id_set.count(mapping.tensor_name)) {
-                mapping.primitive_id = mapping.tensor_name;
-                ++matched;
-            } else {
-                // Try common name transformations
-                // OpenVINO may prefix with "__module." or similar
-                for (const auto& id : all_ids) {
-                    if (id.find(mapping.tensor_name) != std::string::npos ||
-                        mapping.tensor_name.find(id) != std::string::npos) {
-                        mapping.primitive_id = id;
-                        ++matched;
-                        goto next_mapping;
-                    }
-                }
-                ++unmatched;
-                next_mapping:;
+        // Parse layer index from FC name
+        size_t layers_dot = id.find("layers.");
+        if (layers_dot == std::string::npos) continue;
+        size_t num_start = layers_dot + 7;
+        int32_t model_layer = 0;
+        size_t p = num_start;
+        while (p < id.size() && std::isdigit(id[p])) {
+            model_layer = model_layer * 10 + (id[p] - '0');
+            ++p;
+        }
+        
+        // Check streamed range
+        if (model_layer < static_cast<int32_t>(first_streamed) ||
+            model_layer > static_cast<int32_t>(first_streamed + m_header.num_layers - 1))
+            continue;
+        
+        uint32_t packed_layer = static_cast<uint32_t>(model_layer) - first_streamed;
+        
+        // Extract component: text between "layers.N." and "/" 
+        // e.g. "layers.5.mlp.gate_proj/ov_ext..." → "mlp.gate_proj"
+        if (p >= id.size() || id[p] != '.') continue;
+        ++p;  // skip the dot after layer number
+        size_t slash = id.find('/', p);
+        if (slash == std::string::npos) continue;
+        std::string component = id.substr(p, slash - p);
+        
+        // Get FC primitive instance
+        cldnn::primitive_inst* fc_inst = nullptr;
+        try { fc_inst = net->get_primitive(id).get(); } catch (...) { continue; }
+        if (!fc_inst || !fc_inst->is_dynamic()) continue;
+        
+        auto& deps = fc_inst->dependencies();
+        if (deps.size() < 4) continue;  // Need at least: input, weight, scale, zp
+        
+        ++fc_found;
+        
+        auto& offset_table = layer_offset_tables[packed_layer];
+        
+        // === dep[1]: Weight ===
+        auto* weight_dep = deps[1].first;
+        auto weight_mem = weight_dep->output_memory_ptr(deps[1].second);
+        uint64_t weight_size = weight_mem ? weight_mem->size() : 0;
+        
+        std::string weight_key = component + ".weight";
+        auto wit = offset_table.find(weight_key);
+        if (wit != offset_table.end() && wit->second.size_bytes == weight_size) {
+            WeightTensorMapping mapping;
+            mapping.layer_idx = packed_layer;
+            mapping.tensor_name = wit->second.full_name;
+            mapping.primitive_id = weight_dep->id();
+            mapping.offset_in_layer = wit->second.offset_in_layer;
+            mapping.size_bytes = weight_size;
+            mapping.is_fc_weight = true;
+            mapping.fc_primitive_id = id;
+            m_weight_mappings.push_back(std::move(mapping));
+            ++weight_mapped;
+        } else {
+            ++weight_skipped;
+            if (m_config.debug_logging && packed_layer == 0) {
+                std::cout << "[DenseStreaming] Skip weight: " << component
+                          << " dep_size=" << weight_size;
+                if (wit != offset_table.end())
+                    std::cout << " json_size=" << wit->second.size_bytes;
+                else
+                    std::cout << " (no JSON match for '" << weight_key << "')";
+                std::cout << "\n";
             }
         }
         
-        // Remove unmatched tensors from the mapping.
-        // Many tensors in the JSON (tiny constants like neg/Constant,
-        // transpose/Constant) get folded/inlined during GPU compilation
-        // and don't exist as data primitives. We keep them in the offset
-        // computation above (so offsets are correct), but must not try
-        // to swap them at runtime.
-        auto remove_it = std::remove_if(m_weight_mappings.begin(), m_weight_mappings.end(),
-            [&prim_id_set](const WeightTensorMapping& m) {
-                return prim_id_set.count(m.primitive_id) == 0;
-            });
-        size_t removed = std::distance(remove_it, m_weight_mappings.end());
-        m_weight_mappings.erase(remove_it, m_weight_mappings.end());
-        
-        if (m_config.debug_logging) {
-            std::cout << "[DenseStreaming] JSON mapping cross-reference: "
-                      << matched << " matched, " << unmatched << " unmatched"
-                      << " (" << removed << " removed)\n";
+        // === dep[2] (Scale) and dep[3] (ZP): NOT mapped ===
+        // Scales and zero points go through propagate_constants reorder
+        // in the GPU compiler. Their compiled format differs from the raw
+        // IR data in our binary file. Only unreordered FC weights (dep[1])
+        // can be safely swapped from the binary.
+        // Scale/ZP primitives remain pinned in GPU memory (small: ~5 MB/layer).
+    }
+    
+    if (m_config.debug_logging) {
+        uint64_t total_bytes = 0;
+        for (const auto& m : m_weight_mappings) total_bytes += m.size_bytes;
+        std::cout << "[DenseStreaming] FC scan results:\n"
+                  << "  FC primitives found: " << fc_found << "\n"
+                  << "  Weights mapped: " << weight_mapped 
+                  << " (skipped: " << weight_skipped << ")\n"
+                  << "  Scales mapped:  " << scale_mapped
+                  << " (skipped: " << scale_skipped << ")\n"
+                  << "  ZPs mapped:     " << zp_mapped << "\n"
+                  << "  Total mapping:  " << m_weight_mappings.size() 
+                  << " tensors, " << (total_bytes / (1024.0*1024.0)) << " MB\n";
+
+        // Debug: dump mapping to file
+        std::string dbg_path = m_config.weights_file_path;
+        auto dp = dbg_path.rfind('.');
+        if (dp != std::string::npos) dbg_path = dbg_path.substr(0, dp);
+        dbg_path += "_fc_mapping.txt";
+        FILE* dbg = fopen(dbg_path.c_str(), "w");
+        if (dbg) {
+            fprintf(dbg, "=== FC Weight Mapping (%zu entries) ===\n", m_weight_mappings.size());
+            for (const auto& m : m_weight_mappings) {
+                fprintf(dbg, "  layer=%u %s offset=%llu size=%llu %s prim=%s fc=%s\n",
+                    m.layer_idx, m.tensor_name.c_str(),
+                    (unsigned long long)m.offset_in_layer,
+                    (unsigned long long)m.size_bytes,
+                    m.is_fc_weight ? "[FC_WEIGHT]" : "[DATA]",
+                    m.primitive_id.c_str(),
+                    m.fc_primitive_id.c_str());
+            }
+            fclose(dbg);
+            std::cout << "[DenseStreaming] FC mapping written to: " << dbg_path << "\n";
         }
     }
+    
 #else
     (void)network_ptr;
 #endif
@@ -1094,7 +1355,8 @@ bool DenseWeightStreamingManager::build_weight_mapping_from_json(
             const auto& m = m_weight_mappings[i];
             std::cout << "  [" << m.layer_idx << "] " << m.tensor_name
                       << " @ offset " << m.offset_in_layer 
-                      << " (" << m.size_bytes << " bytes)\n";
+                      << " (" << m.size_bytes << " bytes)"
+                      << (m.is_fc_weight ? " [FC_WEIGHT]" : "") << "\n";
         }
         if (m_weight_mappings.size() > 5) {
             std::cout << "  ... and " << (m_weight_mappings.size() - 5) << " more\n";
@@ -1139,7 +1401,7 @@ bool DenseWeightStreamingManager::swap_weight_pointers(uint32_t group_idx, void*
     
     // Find which buffer holds this group (for create_subbuffer)
     int buf_idx = -1;
-    for (int i = 0; i < NUM_BUFFERS; ++i) {
+    for (int i = 0; i < m_num_buffers; ++i) {
         if (m_buffer_group[i] == static_cast<int32_t>(group_idx)) {
             buf_idx = i;
             break;
@@ -1168,7 +1430,7 @@ bool DenseWeightStreamingManager::swap_weight_pointers(uint32_t group_idx, void*
         uint64_t layer_offset = m_layer_table[mapping.layer_idx].offset_in_group;
         uint64_t tensor_byte_offset = layer_offset + mapping.offset_in_layer;
         
-        // Get the original tensor's layout from the data primitive
+        // Get the data primitive (dep[1] for FC weights, or scale/zp data prim)
         auto data_inst = net->get_primitive(mapping.primitive_id);
         if (!data_inst) {
             if (m_config.debug_logging) {
@@ -1181,18 +1443,43 @@ bool DenseWeightStreamingManager::swap_weight_pointers(uint32_t group_idx, void*
         auto original_layout = data_inst->output_memory_ptr(0)->get_layout();
         
         // Create a USM sub-buffer from our streaming buffer (zero-copy).
-        // engine.create_subbuffer() creates a proper gpu_usm object that
-        // preserves USM allocation type and metadata, so oneDNN and OCL
-        // kernels can use it directly (unlike attach_memory which creates
-        // a simple_attached_memory incompatible with oneDNN).
         auto new_mem = m_engine.create_subbuffer(
             *m_buffers[buf_idx], original_layout, 
             static_cast<size_t>(tensor_byte_offset));
         
-        // Force-swap the data primitive's output memory
-        // REQUIRES: force_set_output_memory() added to primitive_inst.h
-        data_inst->force_set_output_memory(std::move(new_mem), 0);
-        ++swapped;
+        if (mapping.is_fc_weight) {
+            // ============================================================
+            // FC WEIGHT PATH: replace both dep[1] output AND weight cache
+            // ============================================================
+            //
+            // Dynamic FC primitives use _reordered_weights_cache for
+            // weights_memory(), NOT dep_memory_ptr(1) directly.
+            // We must update BOTH:
+            //   1. dep[1]'s output (so update_weights() sees new data)
+            //   2. The FC's cache entry (so weights_memory() returns new data)
+            
+            // Step 1: Replace dep[1] data primitive's output
+            data_inst->force_set_output_memory(new_mem, 0);
+            
+            // Step 2: Replace FC's weight cache entry
+            auto fc_inst = net->get_primitive(mapping.fc_primitive_id);
+            if (fc_inst) {
+                auto weights_layout_opt = fc_inst->get_impl_params()->weights_layout;
+                if (weights_layout_opt.has_value()) {
+                    fc_inst->update_weights_cache(weights_layout_opt.value(), new_mem);
+                } else {
+                    // weights_layout not set yet — just rely on dep[1] replacement
+                    // update_weights() will pick up the new dep[1] on next call
+                }
+            }
+            ++swapped;
+        } else {
+            // ============================================================
+            // DATA PRIMITIVE PATH: scale/zp — direct output replacement
+            // ============================================================
+            data_inst->force_set_output_memory(std::move(new_mem), 0);
+            ++swapped;
+        }
     }
     
     // NOTE: Kernel argument rebinding is NOT done here.

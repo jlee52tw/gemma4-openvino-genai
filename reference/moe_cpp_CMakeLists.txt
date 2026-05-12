@@ -1,0 +1,106 @@
+# Standalone build for moe_otd_gpt_oss sample and DirectStorage benchmark
+#
+# Avoids the full samples build infrastructure (OpenCV, benchmark_app,
+# etc.)
+
+cmake_minimum_required(VERSION 3.16)
+project(moe_otd_tools LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# --- DirectStorage SDK (shared by both targets) ---
+
+# Auto-download from NuGet if not already present.
+set(DS_VERSION "1.3.0")
+set(DS_PKG_DIR "${CMAKE_SOURCE_DIR}/packages/Microsoft.Direct3D.DirectStorage.${DS_VERSION}")
+set(DS_BIN_DIR "${DS_PKG_DIR}/native/bin/x64")
+set(DS_INC_DIR "${DS_PKG_DIR}/native/include")
+set(DS_LIB_DIR "${DS_PKG_DIR}/native/lib/x64")
+
+if(NOT EXISTS "${DS_BIN_DIR}/dstorage.dll")
+    message(STATUS "DirectStorage NuGet package not found, downloading...")
+
+    # Check for nuget.exe, download if missing
+    set(NUGET_EXE "${CMAKE_SOURCE_DIR}/packages/nuget.exe")
+    if(NOT EXISTS "${NUGET_EXE}")
+        message(STATUS "Downloading nuget.exe...")
+        file(DOWNLOAD
+            "https://dist.nuget.org/win-x86-commandline/latest/nuget.exe"
+            "${NUGET_EXE}"
+            SHOW_PROGRESS
+        )
+    endif()
+
+    execute_process(
+        COMMAND "${NUGET_EXE}" install Microsoft.Direct3D.DirectStorage
+                -Version ${DS_VERSION}
+                -OutputDirectory "${CMAKE_SOURCE_DIR}/packages"
+                -NonInteractive
+        RESULT_VARIABLE nuget_result
+    )
+    if(NOT nuget_result EQUAL 0)
+        message(WARNING "Failed to download DirectStorage NuGet package (exit code ${nuget_result}). "
+                        "DirectStorage will not be available — falling back to mmap/Direct I/O.")
+    endif()
+endif()
+
+set(DS_AVAILABLE FALSE)
+if(EXISTS "${DS_BIN_DIR}/dstorage.dll")
+    message(STATUS "DirectStorage DLLs found: ${DS_BIN_DIR}")
+    set(DS_AVAILABLE TRUE)
+else()
+    message(WARNING "DirectStorage DLLs not found at ${DS_BIN_DIR}. "
+                    "DirectStorage will not be available at runtime.")
+endif()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Target 1: moe_otd_gpt_oss (requires OpenVINO GenAI)
+# ═══════════════════════════════════════════════════════════════════════════
+
+find_package(OpenVINOGenAI REQUIRED
+    PATHS
+        "${CMAKE_BINARY_DIR}"
+        ${OpenVINO_DIR}
+    NO_CMAKE_FIND_ROOT_PATH
+)
+
+add_executable(moe_otd_gpt_oss moe_otd_gpt_oss.cpp)
+target_link_libraries(moe_otd_gpt_oss PRIVATE openvino::genai)
+
+if(DS_AVAILABLE)
+    add_custom_command(TARGET moe_otd_gpt_oss POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DS_BIN_DIR}/dstorage.dll"
+            "${DS_BIN_DIR}/dstoragecore.dll"
+            "$<TARGET_FILE_DIR:moe_otd_gpt_oss>"
+        COMMENT "Copying DirectStorage DLLs to moe_otd_gpt_oss output"
+    )
+endif()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Target 2: moe_otd_directstorage (standalone, no OpenVINO dependency)
+# ═══════════════════════════════════════════════════════════════════════════
+
+if(DS_AVAILABLE AND EXISTS "${DS_LIB_DIR}/dstorage.lib")
+    add_executable(moe_otd_directstorage moe_otd_directstorage.cpp)
+
+    target_include_directories(moe_otd_directstorage PRIVATE "${DS_INC_DIR}")
+    target_link_libraries(moe_otd_directstorage PRIVATE
+        "${DS_LIB_DIR}/dstorage.lib"
+        ole32
+    )
+
+    add_custom_command(TARGET moe_otd_directstorage POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DS_BIN_DIR}/dstorage.dll"
+            "${DS_BIN_DIR}/dstoragecore.dll"
+            "$<TARGET_FILE_DIR:moe_otd_directstorage>"
+        COMMENT "Copying DirectStorage DLLs to moe_otd_directstorage output"
+    )
+
+    message(STATUS "DirectStorage benchmark target: moe_otd_directstorage ENABLED")
+else()
+    message(WARNING "DirectStorage SDK libs not found at ${DS_LIB_DIR}. "
+                    "moe_otd_directstorage target will NOT be built.")
+endif()

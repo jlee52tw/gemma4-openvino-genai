@@ -37,3 +37,34 @@ if(WIN32)
 endif()
 
 install(TARGETS run_gemma4 benchmark_kpi RUNTIME DESTINATION bin)
+
+# ── Build library: dense_weight_streaming ──────────────────────────────────
+# This is the DirectStorage-based weight streaming manager for dense models.
+# Requires Windows SDK and optionally DirectStorage 1.3.0+ NuGet package.
+option(ENABLE_DIRECTSTORAGE "Enable DirectStorage for weight streaming" OFF)
+
+add_library(dense_weight_streaming STATIC
+    dense_weight_streaming_manager.cpp
+    dense_weight_streaming_manager.hpp)
+target_include_directories(dense_weight_streaming PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+if(WIN32)
+    target_link_libraries(dense_weight_streaming PRIVATE kernel32)
+endif()
+
+if(ENABLE_DIRECTSTORAGE)
+    target_compile_definitions(dense_weight_streaming PRIVATE OPENVINO_USE_DIRECTSTORAGE)
+    # DirectStorage SDK (install via NuGet: Microsoft.Direct3D.DirectStorage 1.3.0)
+    # Set DSTORAGE_DIR to the NuGet package path:
+    #   -DDSTORAGE_DIR=<path>/Microsoft.Direct3D.DirectStorage.1.3.0
+    if(DSTORAGE_DIR)
+        target_include_directories(dense_weight_streaming PRIVATE
+            "${DSTORAGE_DIR}/include")
+        target_link_directories(dense_weight_streaming PRIVATE
+            "${DSTORAGE_DIR}/lib/x64")
+        target_link_libraries(dense_weight_streaming PRIVATE dstorage)
+    else()
+        message(WARNING "ENABLE_DIRECTSTORAGE=ON but DSTORAGE_DIR not set. "
+                        "Set -DDSTORAGE_DIR=<NuGet-package-path>")
+    endif()
+endif()

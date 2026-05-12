@@ -1,0 +1,300 @@
+diff --git a/src/plugins/intel_gpu/include/intel_gpu/graph/network.hpp b/src/plugins/intel_gpu/include/intel_gpu/graph/network.hpp
+index fe56224e17..1013daa914 100644
+--- a/src/plugins/intel_gpu/include/intel_gpu/graph/network.hpp
++++ b/src/plugins/intel_gpu/include/intel_gpu/graph/network.hpp
+@@ -26,6 +26,7 @@
+ 
+ namespace ov::intel_gpu {
+ class OutputMemoryBlock;
++class DenseWeightStreamingManager;
+ }  // namespace ov::intel_gpu
+ 
+ namespace cldnn {
+@@ -166,6 +167,26 @@ public:
+     void validate_primitives();
+     void preallocate_shape_info_buffers();
+     void set_arguments();
++
++    // ========================================================================
++    // Dense Weight Streaming support (research prototype)
++    // ========================================================================
++
++    /// @brief Force re-binding of kernel arguments on next set_arguments() call.
++    /// Must be called after force_set_output_memory() swaps weight pointers
++    /// so that GPU kernels pick up the new USM addresses.
++    void invalidate_arguments() { _reset_arguments = true; }
++
++    /// @brief Access the topologically-sorted execution order.
++    /// Used by DenseWeightStreamingManager::build_group_exec_order() to
++    /// partition primitives into per-layer-group lists.
++    const std::list<std::shared_ptr<primitive_inst>>& get_exec_order() const { return _exec_order; }
++
++    /// @brief Execute a subset of primitives (one layer group).
++    /// Replicates the per-primitive logic from execute_impl() but only
++    /// for the specified primitives. Used for per-group streaming execution.
++    void execute_primitive_group(const std::vector<primitive_inst*>& prims);
++
+     // Implementation specific calls
+     bool does_node_need_lockable_output(const primitive_id& id) const;
+     std::shared_ptr<primitive_inst> get_primitive(const primitive_id& id);
+@@ -229,6 +250,19 @@ public:
+     std::shared_ptr<ShapePredictor> get_shape_predictor() { return _shape_predictor; }
+     void set_shape_predictor(std::shared_ptr<ShapePredictor> shape_predictor) { _shape_predictor = shape_predictor; }
+ 
++    // ========================================================================
++    // Dense Weight Streaming: integration entry point
++    // ========================================================================
++
++    /// @brief Enable dense weight streaming for this network.
++    /// Called by try_init_dense_streaming() on first execute_impl() call
++    /// when OV_DENSE_STREAM_WEIGHTS environment variable is set.
++    void enable_dense_weight_streaming(
++        std::shared_ptr<ov::intel_gpu::DenseWeightStreamingManager> mgr);
++
++    /// @brief Check if dense weight streaming is active
++    bool has_dense_weight_streaming() const;
++
+ #ifdef GPU_DEBUG_CONFIG
+     int64_t get_current_iteration_num() const { return iteration; }
+ #else
+@@ -293,6 +327,12 @@ private:
+                                   bool transpose_required);
+     void dump_memory_pool(std::string dump_path, int64_t curr_iter);
+ 
++    // Dense weight streaming
++    std::shared_ptr<ov::intel_gpu::DenseWeightStreamingManager> m_dense_streaming;
++    bool m_dense_streaming_checked = false;
++    void try_init_dense_streaming();
++    void execute_impl_streamed(const std::vector<event::ptr>& events);
++
+ #ifdef GPU_DEBUG_CONFIG
+     mutable int64_t iteration = 0;
+     friend class NetworkDebugHelper;
+diff --git a/src/plugins/intel_gpu/src/graph/CMakeLists.txt b/src/plugins/intel_gpu/src/graph/CMakeLists.txt
+index 26c3caa82f..aa83beceb4 100644
+--- a/src/plugins/intel_gpu/src/graph/CMakeLists.txt
++++ b/src/plugins/intel_gpu/src/graph/CMakeLists.txt
+@@ -144,4 +144,11 @@ ov_set_threading_interface_for(${TARGET_NAME})
+ 
+ set_target_properties(${TARGET_NAME} PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE ${ENABLE_LTO})
+ 
++
++# Dense Weight Streaming integration
++if(WIN32)
++    target_compile_definitions(${TARGET_NAME} PRIVATE OV_DENSE_WEIGHT_STREAMING_ENABLED)
++    target_link_libraries(${TARGET_NAME} PRIVATE winmm.lib)
++endif()
++# End Dense Weight Streaming
+ ov_install_static_lib(${TARGET_NAME} ${OV_CPACK_COMP_CORE})
+diff --git a/src/plugins/intel_gpu/src/graph/include/primitive_inst.h b/src/plugins/intel_gpu/src/graph/include/primitive_inst.h
+index d67f2fceca..2b3fb3169c 100644
+--- a/src/plugins/intel_gpu/src/graph/include/primitive_inst.h
++++ b/src/plugins/intel_gpu/src/graph/include/primitive_inst.h
+@@ -240,6 +240,22 @@ public:
+     const ExecutionConfig& get_config() const { return get_network().get_config(); }
+ 
+     virtual event::ptr set_output_memory(memory::ptr mem, bool check = true, size_t idx = 0);
++
++    /// @brief Force-swap output memory without constant/compatibility checks.
++    /// Used by dense weight streaming to redirect data (constant) primitive
++    /// outputs to streaming buffer sub-regions. Unlike set_output_memory(),
++    /// this does NOT copy data for constant nodes — it directly replaces
++    /// the memory pointer, which is required for zero-copy weight streaming.
++    ///
++    /// Caller must ensure:
++    ///   1. The new memory has the same layout as the original
++    ///   2. network::set_arguments() is called after all swaps to re-bind
++    ///      GPU kernel arguments
++    void force_set_output_memory(memory::ptr mem, size_t idx = 0) {
++        OPENVINO_ASSERT(idx < _outputs.size(), "Output index out of range");
++        _outputs[idx] = std::move(mem);
++    }
++
+     /**
+     * Validates whether the provided memory object can be set for a primitive.
+     * This function checks that:
+diff --git a/src/plugins/intel_gpu/src/graph/network.cpp b/src/plugins/intel_gpu/src/graph/network.cpp
+index 2b71b98e84..cc04128321 100644
+--- a/src/plugins/intel_gpu/src/graph/network.cpp
++++ b/src/plugins/intel_gpu/src/graph/network.cpp
+@@ -50,6 +50,12 @@
+ #include <fstream>
+ 
+ #include "debug_helper.hpp"
++
++// Dense Weight Streaming integration (research prototype)
++#ifdef OV_DENSE_WEIGHT_STREAMING_ENABLED
++#include "dense_weight_streaming_manager.hpp"
++#endif
++
+ #ifdef GPU_DEBUG_CONFIG
+ #include <fstream>
+ #include <sys/stat.h>
+@@ -903,6 +909,15 @@ bool network::has_event(const primitive_id& id) const {
+ }
+ 
+ void network::execute_impl(const std::vector<event::ptr>& events) {
++    // Dense weight streaming: lazy initialization + streamed execution path
++    if (!m_dense_streaming_checked) {
++        try_init_dense_streaming();
++    }
++    if (has_dense_weight_streaming()) {
++        execute_impl_streamed(events);
++        return;
++    }
++
+     set_arguments();
+ 
+     // This extra flush command is needed for dynamic models in both cases of out_of_order / in_order operating mode
+@@ -941,6 +956,17 @@ void network::execute_impl(const std::vector<event::ptr>& events) {
+     }
+ }
+ 
++void network::execute_primitive_group(const std::vector<primitive_inst*>& prims) {
++    // Execute a subset of primitives (one layer group for dense weight streaming).
++    // Replicates the per-primitive logic from execute_impl() but only for the
++    // specified primitives. No flush between groups — let GPU handle scheduling.
++    for (auto* inst : prims) {
++        inst->reset_events();
++        inst->prepare_primitive();
++        inst->execute();
++    }
++}
++
+ std::vector<primitive_id> network::get_input_ids() const {
+     std::vector<primitive_id> ret;
+     ret.reserve(_inputs.size());
+@@ -1226,5 +1252,133 @@ void network::set_reuse_variable_mem(bool reuse) {
+     _reuse_variable_mem = reuse;
+ }
+ 
++// ============================================================================
++// Dense Weight Streaming (research prototype)
++// ============================================================================
++
++void network::enable_dense_weight_streaming(
++    std::shared_ptr<ov::intel_gpu::DenseWeightStreamingManager> mgr) {
++    m_dense_streaming = std::move(mgr);
++}
++
++bool network::has_dense_weight_streaming() const {
++    return m_dense_streaming && m_dense_streaming->is_initialized();
++}
++
++void network::try_init_dense_streaming() {
++    m_dense_streaming_checked = true;
++
++#ifdef OV_DENSE_WEIGHT_STREAMING_ENABLED
++    const char* path = std::getenv("OV_DENSE_STREAM_WEIGHTS");
++    if (!path || path[0] == '\0') return;
++
++    std::cout << "[DenseStreaming] Initializing from " << path << "\n";
++
++    ov::intel_gpu::DenseStreamingConfig config;
++    config.weights_file_path = path;
++    config.enable_timing = true;
++    config.read_from_env();
++
++    auto mgr = std::make_shared<ov::intel_gpu::DenseWeightStreamingManager>(
++        _engine, config);
++
++    if (!mgr->initialize()) {
++        std::cerr << "[DenseStreaming] Failed to initialize!\n";
++        return;
++    }
++
++    // Build weight mapping by scanning network primitives
++    if (!mgr->build_weight_mapping(this)) {
++        std::cerr << "[DenseStreaming] Failed to build weight mapping!\n";
++        return;
++    }
++
++    // Build execution order partition
++    if (!mgr->build_group_exec_order(this)) {
++        std::cerr << "[DenseStreaming] Failed to build group exec order!\n";
++        return;
++    }
++
++    m_dense_streaming = std::move(mgr);
++    std::cout << "[DenseStreaming] Initialized: " << m_dense_streaming->num_groups()
++              << " groups, streaming " << m_dense_streaming->num_streamed_layers()
++              << " layers, pinned head=" << m_dense_streaming->pin_head_layers()
++              << " tail=" << m_dense_streaming->pin_tail_layers() << "\n";
++#else
++    (void)this;
++#endif
++}
++
++void network::execute_impl_streamed(const std::vector<event::ptr>& events) {
++#ifdef OV_DENSE_WEIGHT_STREAMING_ENABLED
++    // ------------------------------------------------------------------
++    // Streamed execution: pre-decoder → HEAD → MIDDLE (streamed) → TAIL → post-decoder
++    // ------------------------------------------------------------------
++    // Instead of running all primitives sequentially, we partition them by
++    // decoder layer group and swap weight pointers between groups.
++
++    // Reset events for ALL primitives first (same as execute_impl)
++    for (auto& inst : _exec_order) {
++        inst->reset_events();
++        if (inst->is_input())
++            inst->add_dep_events(events);
++    }
++
++    // Phase 0: Pre-decoder (embeddings, vision encoder, etc.)
++    {
++        const auto& prims = m_dense_streaming->get_group_exec_primitives(
++            m_dense_streaming->exec_slot_pre_decoder());
++        for (auto* p : prims) {
++            auto* inst = static_cast<primitive_inst*>(p);
++            inst->prepare_primitive();
++            inst->execute();
++        }
++    }
++
++    // Phases 1-3: Streaming decode pipeline (HEAD → MIDDLE → TAIL)
++    auto compute_fn = [this](uint32_t group_idx, uint32_t /*first_layer*/,
++                              uint32_t /*num_layers*/) -> bool {
++        uint32_t slot;
++        if (group_idx == UINT32_MAX)
++            slot = m_dense_streaming->exec_slot_pinned_head();
++        else if (group_idx == UINT32_MAX - 1)
++            slot = m_dense_streaming->exec_slot_pinned_tail();
++        else
++            slot = group_idx;
++
++        const auto& prims = m_dense_streaming->get_group_exec_primitives(slot);
++        for (auto* p : prims) {
++            auto* inst = static_cast<primitive_inst*>(p);
++            inst->prepare_primitive();
++            inst->execute();
++        }
++        return true;
++    };
++
++    m_dense_streaming->execute_streamed_decode(
++        compute_fn, this, _stream.get());
++
++    // Phase 4: Post-decoder (final norm, lm_head, logits)
++    {
++        const auto& prims = m_dense_streaming->get_group_exec_primitives(
++            m_dense_streaming->exec_slot_post_decoder());
++        for (auto* p : prims) {
++            auto* inst = static_cast<primitive_inst*>(p);
++            inst->prepare_primitive();
++            inst->execute();
++        }
++    }
++
++    get_stream().flush();
++
++    // Reset all flags for the next execution
++    for (auto& inst : _exec_order) {
++        inst->reset_flags();
++    }
++#else
++    // Should never reach here if OV_DENSE_WEIGHT_STREAMING_ENABLED is off
++    execute_impl(events);
++#endif
++}
+ 
+ }  // namespace cldnn

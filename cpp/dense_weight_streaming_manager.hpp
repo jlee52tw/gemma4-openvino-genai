@@ -127,12 +127,18 @@ struct LayerTableEntry {
 /// pack_dense_weights.py and cross-referencing with the compiled network's
 /// primitive IDs.
 struct WeightTensorMapping {
-    uint32_t layer_idx;          // Decoder layer index (0-41)
-    std::string tensor_name;     // OV constant name, e.g. "__module.model.layers.5.self_attn.q_proj.weight"
-    std::string primitive_id;    // primitive_id in compiled cldnn::network (may == tensor_name or be renamed)
+    uint32_t layer_idx;          // Packed layer index (0..num_layers-1)
+    std::string tensor_name;     // OV constant name or JSON tensor name
+    std::string primitive_id;    // primitive_id in compiled cldnn::network (data primitive)
     uint64_t offset_in_layer;   // Byte offset within the layer's packed data
     uint64_t size_bytes;         // Tensor size in bytes
-    // In full integration, also store: cldnn::layout for attach_memory()
+
+    // FC weight cache integration (for dynamic FullyConnectedCompressed):
+    // When is_fc_weight==true, the tensor is a weight dependency of a dynamic FC.
+    // swap_weight_pointers() must replace the FC's _reordered_weights_cache entry
+    // AND the dep data primitive's output memory (for update_weights correctness).
+    bool is_fc_weight = false;          // true = swap via FC weight cache
+    std::string fc_primitive_id;        // FC primitive's ID (for update_weights_cache)
 };
 // ============================================================================
 // Callback & Pipeline Types (Step 6 — boundary synchronization)
@@ -237,8 +243,15 @@ struct DenseStreamingConfig {
     /// Enable debug logging
     bool debug_logging = false;
     
+    /// Path for debug log file (empty = stderr). Set via OV_DENSE_STREAM_LOG_FILE
+    std::string debug_log_path;
+    
     /// Maximum memory budget for streaming buffers (bytes, 0 = auto)
     uint64_t max_buffer_bytes = 0;
+    
+    /// Number of streaming buffers (2 = double-buffer, 3 = triple-buffer for
+    /// multi-group prefetch pipeline). Set via OV_DENSE_STREAM_NUM_BUFFERS.
+    uint32_t num_buffers = 2;
     
     // ====================================================================
     // Hybrid Pinning Strategy (H5+T5 default)
@@ -283,6 +296,23 @@ struct DenseStreamingConfig {
     
     /// Read from environment variables (OV_DENSE_STREAM_*)
     void read_from_env();
+};
+
+// ============================================================================
+// Per-Token Timing Record (for debug analysis)
+// ============================================================================
+
+/// @brief Timing breakdown for one token's streamed execution
+struct TokenTimingRecord {
+    uint32_t token_idx = 0;
+    double total_ms = 0.0;         // Wall-clock for entire execute_impl_streamed
+    double flush_ms = 0.0;         // GPU fence (get_stream().flush)
+    double load_ms = 0.0;          // NVMe IO wait (wait_for_load / load_group)
+    double swap_ms = 0.0;          // swap_weight_pointers (create_subbuffer + force_set)
+    double set_args_ms = 0.0;      // set_arguments (rebind kernel args)
+    double gpu_compute_ms = 0.0;   // GPU execution (total - flush - load - swap - set_args)
+    uint32_t group_transitions = 0;
+    uint32_t prims_executed = 0;
 };
 
 // ============================================================================
@@ -348,6 +378,9 @@ public:
     
     /// @brief Get layers per group
     uint32_t group_size() const { return m_header.group_size; }
+    
+    /// @brief Get number of streaming buffers (2=double, 3=triple, etc.)
+    int get_num_buffers() const { return m_num_buffers; }
     
     /// @brief Get total model weight size
     uint64_t total_weight_bytes() const { return m_header.total_weight_bytes; }
@@ -619,17 +652,21 @@ private:
     std::vector<GroupTableEntry> m_group_table;
     std::vector<LayerTableEntry> m_layer_table;
     
-    // Double-buffer USM allocations
-    // Buffer[0] and Buffer[1] alternate: one is "active" (GPU reads from it),
-    // the other is "loading" (IO threads write to it).
-    static constexpr int NUM_BUFFERS = 2;
-    cldnn::memory_ptr m_buffers[NUM_BUFFERS];  // USM host allocations
-    void* m_buffer_ptrs[NUM_BUFFERS] = {nullptr, nullptr};
-    uint64_t m_buffer_sizes[NUM_BUFFERS] = {0, 0};
+    // Multi-buffer USM allocations (2-4 buffers)
+    // One buffer is "active" (GPU reads from it), others are available for
+    // prefetch. With 3+ buffers, multiple groups can be prefetched ahead.
+    static constexpr int MAX_BUFFERS = 4;
+    int m_num_buffers = 2;  // Actual count (from config)
+    cldnn::memory_ptr m_buffers[MAX_BUFFERS];  // USM host allocations
+    void* m_buffer_ptrs[MAX_BUFFERS] = {};
+    uint64_t m_buffer_sizes[MAX_BUFFERS] = {};
     int m_active_buffer = 0;  // Index of buffer currently being read by GPU
     
     // Track which group is loaded in each buffer (-1 = empty)
-    int32_t m_buffer_group[NUM_BUFFERS] = {-1, -1};
+    int32_t m_buffer_group[MAX_BUFFERS] = {-1, -1, -1, -1};
+    
+    /// @brief Find a free (non-active) buffer for loading. Returns buffer index.
+    int find_free_buffer(uint32_t exclude_group = UINT32_MAX) const;
     
     // Direct I/O file handles (one per IO thread for concurrent reads)
     // Opened with FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN
@@ -672,6 +709,28 @@ private:
     
     // Pipeline timing (last token)
     TokenPipelineStats m_last_token_stats;
+    
+    // Debug log file (nullptr = use stderr)
+    FILE* m_debug_log = nullptr;
+    
+    // Per-token timing records (for post-analysis)
+    std::vector<TokenTimingRecord> m_token_timings;
+    uint32_t m_token_counter = 0;
+
+public:
+    /// @brief Get debug log file handle (nullptr → stderr)
+    FILE* debug_log_file() const { return m_debug_log ? m_debug_log : stderr; }
+    
+    /// @brief Number of token timing records collected so far
+    size_t token_timings_count() const { return m_token_timings.size(); }
+    
+    /// @brief Record timing for one token
+    void record_token_timing(const TokenTimingRecord& record);
+    
+    /// @brief Write all token timings to log file + summary
+    void flush_token_timings();
+
+private:
     
     // Synchronization
     std::mutex m_load_mutex;  // Protects load operations

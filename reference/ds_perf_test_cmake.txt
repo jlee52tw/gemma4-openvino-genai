@@ -1,0 +1,225 @@
+cmake_minimum_required(VERSION 3.20)
+project(ds_perf_test LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ============================================================================
+# DirectStorage SDK — Auto-download from NuGet or use local/manual path
+# ============================================================================
+#
+# Priority order:
+#   1. User-specified -DDIRECTSTORAGE_SDK_PATH=<path>
+#   2. Previously downloaded in <build>/directstorage_sdk/
+#   3. Existing NuGet package at ../packages/
+#   4. Auto-download from nuget.org (requires internet, first build only)
+#
+set(DIRECTSTORAGE_SDK_PATH "" CACHE PATH
+    "Path to DirectStorage NuGet 'native' directory. Leave empty for auto-download.")
+
+set(DS_NUGET_PACKAGE_NAME  "Microsoft.Direct3D.DirectStorage")
+set(DS_NUGET_PACKAGE_VER   "1.3.0")
+set(DS_LOCAL_SDK_DIR        "${CMAKE_BINARY_DIR}/directstorage_sdk")
+set(DS_FOUND FALSE)
+
+# --- Step 1: Check user-specified path ---
+if(DIRECTSTORAGE_SDK_PATH AND EXISTS "${DIRECTSTORAGE_SDK_PATH}/include/dstorage.h")
+    message(STATUS "[DS] Using user-specified SDK: ${DIRECTSTORAGE_SDK_PATH}")
+    set(DS_FOUND TRUE)
+endif()
+
+# --- Step 2: Check previously downloaded in build dir ---
+if(NOT DS_FOUND)
+    set(_local_native "${DS_LOCAL_SDK_DIR}/${DS_NUGET_PACKAGE_NAME}.${DS_NUGET_PACKAGE_VER}/native")
+    if(EXISTS "${_local_native}/include/dstorage.h")
+        set(DIRECTSTORAGE_SDK_PATH "${_local_native}")
+        message(STATUS "[DS] Using previously downloaded SDK: ${DIRECTSTORAGE_SDK_PATH}")
+        set(DS_FOUND TRUE)
+    endif()
+endif()
+
+# --- Step 3: Check sibling packages/ directory ---
+if(NOT DS_FOUND)
+    set(_sibling_path "${CMAKE_SOURCE_DIR}/../packages/${DS_NUGET_PACKAGE_NAME}.${DS_NUGET_PACKAGE_VER}/native")
+    if(EXISTS "${_sibling_path}/include/dstorage.h")
+        set(DIRECTSTORAGE_SDK_PATH "${_sibling_path}")
+        message(STATUS "[DS] Using sibling packages/ SDK: ${DIRECTSTORAGE_SDK_PATH}")
+        set(DS_FOUND TRUE)
+    endif()
+endif()
+
+# --- Step 4: Auto-download from nuget.org ---
+if(NOT DS_FOUND)
+    message(STATUS "[DS] DirectStorage SDK not found locally. Downloading from nuget.org...")
+
+    set(_nupkg_url "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.directstorage/${DS_NUGET_PACKAGE_VER}/microsoft.direct3d.directstorage.${DS_NUGET_PACKAGE_VER}.nupkg")
+    set(_nupkg_file "${DS_LOCAL_SDK_DIR}/${DS_NUGET_PACKAGE_NAME}.${DS_NUGET_PACKAGE_VER}.nupkg")
+    set(_extract_dir "${DS_LOCAL_SDK_DIR}/${DS_NUGET_PACKAGE_NAME}.${DS_NUGET_PACKAGE_VER}")
+
+    # Create directory
+    file(MAKE_DIRECTORY "${DS_LOCAL_SDK_DIR}")
+
+    # Download .nupkg (it's just a .zip)
+    if(NOT EXISTS "${_nupkg_file}")
+        message(STATUS "[DS] Downloading ${DS_NUGET_PACKAGE_NAME} v${DS_NUGET_PACKAGE_VER}...")
+
+        # Method 1: Try CMake file(DOWNLOAD) first — works when no proxy needed
+        #           or when CMake's libcurl picks up https_proxy env var
+        file(DOWNLOAD
+            "${_nupkg_url}"
+            "${_nupkg_file}"
+            STATUS _dl_status
+            SHOW_PROGRESS
+            TLS_VERIFY ON
+            TIMEOUT 30
+        )
+        list(GET _dl_status 0 _dl_code)
+        list(GET _dl_status 1 _dl_msg)
+
+        if(NOT _dl_code EQUAL 0)
+            message(STATUS "[DS] CMake download failed (${_dl_msg}). Trying PowerShell with proxy...")
+            file(REMOVE "${_nupkg_file}")
+
+            # Method 2: PowerShell Invoke-WebRequest — respects $env:https_proxy
+            #           and works behind corporate proxies (Intel, etc.)
+            execute_process(
+                COMMAND powershell -NoProfile -NonInteractive -Command "
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12;
+                    $proxy = $env:https_proxy;
+                    if (-not $proxy) { $proxy = $env:http_proxy };
+                    $wc = New-Object System.Net.WebClient;
+                    if ($proxy) {
+                        Write-Host '[DS] Using proxy:' $proxy;
+                        $wc.Proxy = New-Object System.Net.WebProxy($proxy);
+                        $wc.Proxy.BypassProxyOnLocal = $true;
+                    };
+                    Write-Host '[DS] Downloading from ${_nupkg_url}...';
+                    $wc.DownloadFile('${_nupkg_url}', '${_nupkg_file}');
+                    Write-Host '[DS] Download complete.'"
+                RESULT_VARIABLE _ps_result
+                OUTPUT_VARIABLE _ps_output
+                ERROR_VARIABLE _ps_error
+                TIMEOUT 60
+            )
+            # Print PowerShell output
+            if(_ps_output)
+                message(STATUS "${_ps_output}")
+            endif()
+
+            if(NOT _ps_result EQUAL 0)
+                message(WARNING "[DS] PowerShell download also failed.")
+                if(_ps_error)
+                    message(WARNING "[DS] Error: ${_ps_error}")
+                endif()
+
+                # Method 3: Try curl.exe if available (ships with Windows 10+)
+                find_program(_curl_exe curl HINTS "C:/Windows/System32" NO_CACHE)
+                if(_curl_exe)
+                    message(STATUS "[DS] Trying curl.exe...")
+                    execute_process(
+                        COMMAND "${_curl_exe}" -L -o "${_nupkg_file}"
+                                --connect-timeout 15 --max-time 60
+                                "${_nupkg_url}"
+                        RESULT_VARIABLE _curl_result
+                    )
+                    if(NOT _curl_result EQUAL 0)
+                        message(WARNING "[DS] curl download failed too.")
+                        file(REMOVE "${_nupkg_file}")
+                    endif()
+                endif()
+            endif()
+        endif()
+
+        # Final check — did any method succeed?
+        if(NOT EXISTS "${_nupkg_file}")
+            message(WARNING "[DS] All download methods failed.")
+            message(WARNING "[DS] If behind a proxy, set environment variables before cmake:")
+            message(WARNING "     $env:https_proxy = \"http://your-proxy:port\"")
+            message(WARNING "     $env:http_proxy  = \"http://your-proxy:port\"")
+            message(WARNING "[DS] Or manually download from:")
+            message(WARNING "     https://www.nuget.org/packages/${DS_NUGET_PACKAGE_NAME}/${DS_NUGET_PACKAGE_VER}")
+            message(WARNING "[DS] Then set -DDIRECTSTORAGE_SDK_PATH=<extracted>/native")
+        endif()
+    endif()
+
+    # Extract .nupkg (rename to .zip for CMake's extract)
+    if(EXISTS "${_nupkg_file}" AND NOT EXISTS "${_extract_dir}/native/include/dstorage.h")
+        message(STATUS "[DS] Extracting NuGet package...")
+        file(ARCHIVE_EXTRACT
+            INPUT "${_nupkg_file}"
+            DESTINATION "${_extract_dir}"
+        )
+    endif()
+
+    # Verify extraction
+    set(_local_native "${_extract_dir}/native")
+    if(EXISTS "${_local_native}/include/dstorage.h")
+        set(DIRECTSTORAGE_SDK_PATH "${_local_native}")
+        message(STATUS "[DS] Successfully downloaded and extracted SDK: ${DIRECTSTORAGE_SDK_PATH}")
+        set(DS_FOUND TRUE)
+    else()
+        message(WARNING "[DS] Extraction failed or SDK structure unexpected.")
+    endif()
+endif()
+
+# --- Final status ---
+if(NOT DS_FOUND)
+    message(WARNING "")
+    message(WARNING "============================================================")
+    message(WARNING "  DirectStorage SDK NOT found. Building WITHOUT DS support.")
+    message(WARNING "  ReadFile, Direct I/O, and mmap benchmarks will still work.")
+    message(WARNING "")
+    message(WARNING "  To enable DirectStorage:")
+    message(WARNING "    1. Re-run cmake (it will auto-download on next configure)")
+    message(WARNING "    2. Or: -DDIRECTSTORAGE_SDK_PATH=<path>/native")
+    message(WARNING "============================================================")
+    message(WARNING "")
+endif()
+
+# ============================================================================
+# Executable
+# ============================================================================
+add_executable(ds_perf_test ds_perf_test.cpp)
+
+target_compile_definitions(ds_perf_test PRIVATE
+    _WIN32_WINNT=0x0A00   # Windows 10+
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+)
+
+if(DS_FOUND)
+    target_include_directories(ds_perf_test PRIVATE "${DIRECTSTORAGE_SDK_PATH}/include")
+    target_link_libraries(ds_perf_test PRIVATE "${DIRECTSTORAGE_SDK_PATH}/lib/x64/dstorage.lib")
+    target_compile_definitions(ds_perf_test PRIVATE HAS_DIRECTSTORAGE=1)
+
+    # Copy DLLs to output directory
+    add_custom_command(TARGET ds_perf_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DIRECTSTORAGE_SDK_PATH}/bin/x64/dstorage.dll"
+            "$<TARGET_FILE_DIR:ds_perf_test>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DIRECTSTORAGE_SDK_PATH}/bin/x64/dstoragecore.dll"
+            "$<TARGET_FILE_DIR:ds_perf_test>"
+        COMMENT "Copying DirectStorage DLLs to output directory..."
+    )
+
+    message(STATUS "")
+    message(STATUS "  DirectStorage: ENABLED")
+    message(STATUS "    Include: ${DIRECTSTORAGE_SDK_PATH}/include")
+    message(STATUS "    Lib:     ${DIRECTSTORAGE_SDK_PATH}/lib/x64/dstorage.lib")
+    message(STATUS "    DLLs:    ${DIRECTSTORAGE_SDK_PATH}/bin/x64/dstorage.dll")
+    message(STATUS "             ${DIRECTSTORAGE_SDK_PATH}/bin/x64/dstoragecore.dll")
+    message(STATUS "")
+else()
+    message(STATUS "")
+    message(STATUS "  DirectStorage: DISABLED (SDK not found)")
+    message(STATUS "")
+endif()
+
+# Windows libs for mmap, Direct I/O, QPC timers
+target_link_libraries(ds_perf_test PRIVATE kernel32)
+
+# Release build with optimizations
+if(MSVC)
+    target_compile_options(ds_perf_test PRIVATE /W4 /O2)
+endif()

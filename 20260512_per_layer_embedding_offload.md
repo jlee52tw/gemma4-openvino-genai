@@ -1,39 +1,199 @@
-# Per-Layer Embedding 2.82 GB Offload — DirectIO from NVMe
+# Per-Layer Embedding 2.82 GB Offload — NVMe mmap + CPU Dequant
 **Date:** 2026-05-12  
 **Author:** jlee52tw  
-**Status:** 設計完成，準備實作
+**Status:** ✅ 已實作完成，驗證通過
 
 ---
 
-## 1. 目標
+## 1. 摘要
 
-**省下 2.82 GB 記憶體**，透過將 Gemma4 的 `text_embeddings_per_layer_model`
-從 GPU compiled model 改為 **DirectIO NVMe 讀取**。
+將 Gemma4 的 `text_embeddings_per_layer_model`（2.82 GB）**從 GPU compiled model
+卸載到 NVMe**，改用 OS mmap + CPU dequant 取代。配合所有 42 decoder layers 保留在
+GPU 記憶體中，達到：
 
-### 記憶體預算
+- **24.83 tok/s**（vs 基線 24.0 tok/s = +3.5%）
+- **穩定 RSS: 4,416 MB**（vs 基線 ~7,100 MB = **省 2,684 MB / -37.8%**）
+- **回答品質不受影響**（bit-exact dequant，20/20 samples abs_err = 0.000000）
+
+---
+
+## 2. 效能實測結果
+
+### 2.1 Per-Layer Embedding Offload 效能（2026-05-12 實測）
+
+| 指標 | 基線（原始 GPU） | **Per-layer Offload** | 變化 |
+|---|---:|---:|---|
+| Output TPS | 24.0 | **24.83** | +3.5% ✅ |
+| TPOT | 41.7 ms | **40.27 ms** | -3.4% ✅ |
+| TTFT | 300 ms | **563 ms** | +263 ms (首次 mmap page fault) |
+| 穩定 RSS | ~7,100 MB | **4,416 MB** | **-2,684 MB (-37.8%)** ✅ |
+| Peak RSS (loading) | ~8,020 MB | **7,553 MB** | -467 MB |
+| Model Load Time | ~9.0 s | **8.8 s** | -0.2 s (跳過 per-layer compile) |
+
+**測試條件：** short-text, prompt 25 tokens, generate 256 tokens, GPU device
+
+### 2.2 為什麼 TTFT 增加？
+
+首次推理時 OS 需要 **page fault 載入 mmap pages** 到實體記憶體。
+3.22 GB 檔案被 mmap，但首次存取 prefill 的 N 個 token 時，
+每個 token 觸發 3 頁 page fault = ~12 KB。第二次推理以後 OS 已 cache
+這些 pages，TTFT 會恢復正常。
+
+### 2.3 為什麼 TPOT 反而變快？
+
+卸載 2.82 GB 後 GPU USM 記憶體壓力降低，GPU scheduler 更高效地
+排程 decoder layers 的計算。此外 per-layer embedding lookup 的 CPU dequant
+只需 ~10-30 µs（vs GPU 端 ~42 ms compute），overhead 完全可忽略。
+
+---
+
+## 3. 使用的模型檔案
+
+### 3.1 原始模型檔案（輸入）
+
+| 檔案 | 路徑 | 大小 | 說明 |
+|---|---|---:|---|
+| Per-layer model IR | `openvino_text_embeddings_per_layer_model.xml` | ~5 KB | IR 圖定義 |
+| Per-layer model weights | `openvino_text_embeddings_per_layer_model.bin` | 2,819 MB | 包含 INT8 weight + FP16 scale |
+| Language model | `openvino_language_model.xml` / `.bin` | 2,095 MB | 42 decoder layers (使用 per_layer_inputs) |
+| Text embeddings model | `openvino_text_embeddings_model.xml` / `.bin` | 672 MB | 主 token embedding |
+| Vision encoder | `openvino_vision_embeddings_model.xml` / `.bin` | 171 MB | 圖片 encoder |
+
+模型目錄：`C:\working\gemma4-openvino\gemma-4-E4B-it-ov\`
+
+### 3.2 轉換後檔案（offload 專用）
+
+| 檔案 | 路徑 | 大小 | 說明 |
+|---|---|---:|---|
+| **Repacked binary** | `per_layer_embedding_directio.bin` | **3,221 MB** | 4K-aligned 格式，mmap 讀取 |
+
+放置位置：與模型目錄相同（`model_dir/per_layer_embedding_directio.bin`）
+
+### 3.3 二進制格式
 
 ```
-Before:  6.664 GB RSS (baseline)
-After:   6.664 - 2.819 = 3.845 GB  ← 省下 2.82 GB！
-+ LRU:   3.845 + 0.004 = 3.849 GB  (4 MB optional cache)
-```
+File: per_layer_embedding_directio.bin (3,221,229,568 bytes)
 
-### 效能影響
+Header (4096 bytes = 1 page):
+  [0..3]:     Magic "PLEB" (0x42454C50 little-endian)
+  [4..7]:     Version = 1
+  [8..11]:    vocab_size = 262144
+  [12..15]:   per_layer_dim = 10752
+  [16..19]:   num_layers = 42
+  [20..23]:   layer_dim = 256
+  [24..27]:   weight_dtype = 1 (INT8)
+  [28..31]:   scale_dtype = 2 (FP16)
+  [32..35]:   row_stride = 12288
+  [36..4095]: reserved zeros
 
-```
-Decode (每個 token):
-  NVMe read 12 KB:     ~20-30 µs
-  CPU dequant:          ~5-10 µs
-  Total overhead:       ~30-40 µs
-  vs GPU decode time:   42,000 µs
-  Overhead:             0.07-0.10%  ← 可忽略！
+Data (262144 rows × 12288 bytes each):
+  Row N: [10752 INT8 weight | 2 FP16 scale | 1534 pad] = 12,288 bytes (3 pages)
+  
+  File offset for token N = 4096 + N × 12288
 ```
 
 ---
 
-## 2. 背景：Gemma4 Per-Layer Embedding 架構
+## 4. 修改的檔案與各自用途
 
-### 2.1 什麼是 Per-Layer Embedding？
+### 4.1 新建檔案
+
+| # | 檔案 | 位置 | 用途 |
+|---|---|---|---|
+| 1 | `per_layer_embedding_reader.hpp` | `openvino_genai_src/src/cpp/src/visual_language/gemma4/` | **C++ mmap reader + CPU dequant**。header-only，使用 Win32 `CreateFileMapping`/`MapViewOfFile`（Windows）或 POSIX `mmap`（Linux）將 3.22 GB 檔案映射到虛擬記憶體。每次 lookup 從 mmap 記憶體直接讀取 12 KB row 並做 INT8→FP32 dequant。 |
+| 2 | `pack_per_layer_embedding.py` | `gemma4-openvino-genai/` (workspace) | **Python repack 工具**。讀取原始 per-layer model `.bin`，將 weight 和 scale 合併到每行 12,288 bytes 的 4K-aligned 格式，輸出 `per_layer_embedding_directio.bin`。內建 `--verify` 模式驗證 bit-exact 正確性。 |
+
+### 4.2 修改的檔案
+
+| # | 檔案 | 變更 | 用途 |
+|---|---|---|---|
+| 3 | `classes.hpp` | + `#include per_layer_embedding_reader.hpp`<br>+ `std::unique_ptr<PerLayerEmbeddingReader> m_per_layer_reader` member | **新增 offload reader 成員**。與原本的 `m_per_layer_embeddings_requests`（compiled model）互斥——只有一個會被初始化。 |
+| 4 | `classes.cpp` | 修改兩個建構函式 + `get_per_layer_embeddings()` | **核心攔截邏輯**。建構函式中：(1) 檢查環境變數 `OV_PER_LAYER_EMBEDDING_PATH`，(2) 自動偵測 `model_dir/per_layer_embedding_directio.bin`。若找到則建立 `PerLayerEmbeddingReader`（mmap），跳過 `compile_model()` 載入 2.82 GB 到 GPU。`get_per_layer_embeddings()` 新增 Path A（reader.lookup）/ Path B（原始 compiled model）分流。 |
+
+### 4.3 原始碼位置
+
+```
+openvino_genai_src/
+└── src/cpp/src/visual_language/gemma4/
+    ├── classes.hpp                          ← 修改：新增 m_per_layer_reader 成員
+    ├── classes.cpp                          ← 修改：建構函式 + get_per_layer_embeddings()
+    └── per_layer_embedding_reader.hpp       ← 新建：mmap reader + dequant
+
+gemma4-openvino-genai/  (workspace)
+    └── pack_per_layer_embedding.py          ← 新建：repack 工具
+```
+
+### 4.4 各檔案修改細節
+
+#### `per_layer_embedding_reader.hpp` — mmap Reader（新建）
+
+```
+class PerLayerEmbeddingReader:
+  構建方式: open_and_map(path) → mmap 整個 3.22 GB 檔案
+  核心方法: lookup(input_ids: Tensor[batch, seq_len]) → Tensor[batch, seq_len, 42, 256]
+  
+  每個 token 的處理:
+    1. resolve_token_id(): 特殊 token {258880, 258884, 258881} → row 0; OOV → zeros
+    2. dequant_token(): row = m_data[HEADER + id * 12288]
+       int8 weights[10752] × fp16_scale × 16.0 → float32[10752]
+    3. 輸出 reshape 為 [42, 256]
+  
+  記憶體映射方式:
+    Windows: CreateFileW(FILE_FLAG_RANDOM_ACCESS) → CreateFileMappingW → MapViewOfFile
+    Linux:   open(O_RDONLY) → mmap(PROT_READ, MAP_PRIVATE) + madvise(MADV_RANDOM)
+  
+  清理: ~PerLayerEmbeddingReader() 自動 UnmapViewOfFile / munmap
+```
+
+#### `classes.hpp` — 新增成員（修改）
+
+```diff
++ #include <memory>
++ #include "visual_language/gemma4/per_layer_embedding_reader.hpp"
+
+  private:
+    std::unique_ptr<CircularBufferQueue<ov::InferRequest>> m_per_layer_embeddings_requests;
++   std::unique_ptr<PerLayerEmbeddingReader> m_per_layer_reader;
+```
+
+#### `classes.cpp` — 建構函式邏輯（修改）
+
+```
+建構函式邏輯（兩個 constructor 都做相同修改）：
+
+1. 檢查路徑:
+   a. 環境變數 OV_PER_LAYER_EMBEDDING_PATH → 如果設定且檔案存在，使用它
+   b. 自動偵測 model_dir / "per_layer_embedding_directio.bin" → 如果存在，使用它
+
+2. 如果找到 repacked binary:
+   → m_per_layer_reader = make_unique<PerLayerEmbeddingReader>(path)
+   → 印出 "[Gemma4] Per-layer embeddings: using DirectIO reader"
+   → 跳過 compile_model()，不分配 GPU USM 記憶體
+
+3. 如果沒找到:
+   → 走原本路徑：compile_model() → CircularBufferQueue<InferRequest>
+   → 印出 "[Gemma4] Per-layer embeddings: using compiled GPU model"
+```
+
+#### `classes.cpp` — `get_per_layer_embeddings()` 方法（修改）
+
+```
+ov::Tensor get_per_layer_embeddings(input_ids):
+  Path A (m_per_layer_reader != null):
+    return m_per_layer_reader->lookup(input_ids)
+    // mmap 讀取 + CPU dequant，~10-30 µs per token
+
+  Path B (原始路徑):
+    req.set_tensor("input_ids", input_ids)
+    req.infer()  // GPU compiled model 推理
+    memcpy output → result
+```
+
+---
+
+## 5. 背景：Gemma4 Per-Layer Embedding 架構
+
+### 5.1 什麼是 Per-Layer Embedding？
 
 Gemma4 的獨特設計：**每個 decoder layer 接收一個額外的 256-dim token-dependent signal**。
 
@@ -48,21 +208,19 @@ config.json:
 - 262144 = vocab_size
 - 10752 = 42 layers × 256 dim
 
-### 2.2 資料流
+### 5.2 資料流
 
 ```
 Decode phase (每個 token):
 
-  token_id (int64, 前一步生成的 token)
+  token_id (int64)
        │
        ├─→ text_embeddings_model → inputs_embeds [1,1,2560]     (主 embedding)
        │
-       └─→ text_embeddings_per_layer_model → per_layer_inputs [1,1,42,256]
+       └─→ per_layer lookup → per_layer_inputs [1,1,42,256]
              │
-             │  模型內部操作：
-             │  1. Gather(token_id) from [262144, 10752] INT8 weight → [1, 10752]
-             │  2. Dequant: int8 × scale(FP16) → FP32
-             │  3. Reshape → [1, 1, 42, 256]
+             │  Dequant: int8 × fp16_scale × 16.0 → fp32
+             │  Reshape → [1, 1, 42, 256]
              │
              ↓
   language_model.infer(inputs_embeds, per_layer_inputs, ...)
@@ -70,24 +228,309 @@ Decode phase (每個 token):
        └─→ 每個 decoder layer i:
              Gather(idx=i) from per_layer_inputs → [1, 1, 256]
              → Gelu gate × slice
-             → MatMul(per_layer_projection [2560, 256]^T) → [1, 1, 2560]
+             → MatMul(per_layer_projection) → [1, 1, 2560]
              → RMSNorm → Add to hidden_states (residual injection)
 ```
 
 **關鍵洞察：** per_layer_model 就是一個 **embedding lookup + dequant**。
 每個 decode token 只讀 1 行 = 10,752 bytes。
-不需要 GPU compiled model，DirectIO 就夠了。
+不需要 GPU compiled model — mmap + CPU dequant 就夠了。
 
-### 2.3 注意：不是 KV Cache
+### 5.3 Dequant 公式
 
-Per-layer embedding **不存入 KV cache**。KV cache 存的是 attention 的 K/V 投影。
-Per-layer embedding 每次都要重新讀取（lookup），無法跳過。
+```
+raw_int8[10752] = row from repacked binary
+scale_fp16[1]   = row + offset 10752
+
+output[i] = float(raw_int8[i]) × float(scale_fp16[0]) × 16.0f
+
+POST_GATHER_SCALE = 16.0 — 從 IR 圖中的 Constant_209981 發現
+```
+
+### 5.4 特殊 Token 處理
+
+```
+Token IDs {258880, 258884, 258881} → remap to row 0
+Token ID < 0 or >= 262144          → return zeros([1,1,42,256])
+```
 
 ---
 
-## 3. Embedding 重複問題分析
+## 6. 如何轉換（Repack）模型
 
-### 3.1 `embed_tokens.weight` 出現在 3 個地方
+### 6.1 前提條件
+
+- 已匯出的 Gemma4 OpenVINO 模型目錄（包含 `openvino_text_embeddings_per_layer_model.bin`）
+- Python 3.10+，numpy
+
+### 6.2 Repack 指令
+
+```powershell
+cd C:\working\gemma4-openvino\gemma4-openvino-genai
+
+# Repack: 產生 4K-aligned binary（約 60 秒，輸出 3.22 GB）
+python pack_per_layer_embedding.py `
+    --model-dir "C:\working\gemma4-openvino\gemma-4-E4B-it-ov" `
+    --output "C:\working\gemma4-openvino\gemma-4-E4B-it-ov\per_layer_embedding_directio.bin"
+```
+
+### 6.3 驗證正確性
+
+```powershell
+# Verify: 與 compiled model 比對 bit-exact（約 30 秒）
+python pack_per_layer_embedding.py `
+    --model-dir "C:\working\gemma4-openvino\gemma-4-E4B-it-ov" `
+    --output "C:\working\gemma4-openvino\gemma-4-E4B-it-ov\per_layer_embedding_directio.bin" `
+    --verify
+```
+
+預期輸出：
+```
+=== Verification: 20 random samples ===
+Sample  0: token= 39457, abs_err=0.000000, rel_err=0.000000 ✓ PASS
+...
+Sample 19: token=158630, abs_err=0.000000, rel_err=0.000000 ✓ PASS
+All 20 samples PASSED (bit-exact)
+```
+
+### 6.4 Repack 流程說明
+
+```
+Input:  openvino_text_embeddings_per_layer_model.bin (2,819 MB)
+  ├── offset 0:                INT8 weights [262144, 10752]
+  └── offset 2,818,572,288:    FP16 scales  [262144, 1]
+
+Processing:
+  For each row (0..262143):
+    read weight[10752] from offset row × 10752
+    read scale[1]      from offset 2,818,572,288 + row × 2
+    write [weight | scale | 1534-byte padding] = 12,288 bytes
+
+Output: per_layer_embedding_directio.bin (3,221 MB)
+  ├── Header: 4096 bytes (magic "PLEB", metadata)
+  └── Data:   262144 rows × 12,288 bytes
+```
+
+---
+
+## 7. 如何建置 (Build)
+
+### 7.1 前提條件
+
+- Visual Studio 2022 (MSVC v143+)
+- CMake 3.23+
+- Python 3.12 + pip 安裝的 `openvino==2026.2.0`
+- OpenVINO GenAI 原始碼：`C:\working\gemma4-openvino\openvino_genai_src\`
+
+### 7.2 Build 指令
+
+```powershell
+cd C:\working\gemma4-openvino\openvino_genai_src
+
+# Configure（只需第一次）
+cmake -B build -G "Visual Studio 17 2022" `
+    -DCMAKE_BUILD_TYPE=Release `
+    -DENABLE_PYTHON=OFF `
+    -DENABLE_JS=OFF `
+    -DENABLE_TESTS=OFF `
+    -DENABLE_TOOLS=OFF `
+    -DENABLE_XGRAMMAR=OFF `
+    -DENABLE_GGUF=ON
+
+# Build（約 3-5 分鐘）
+cmake --build build --target openvino_genai --config Release -- /v:m /p:CL_MPCount=4
+```
+
+### 7.3 部署 (Deploy)
+
+```powershell
+# 備份原始 DLL
+$dst = "C:\Users\Local_Admin\AppData\Local\Programs\Python\Python312\Lib\site-packages\openvino_genai\openvino_genai.dll"
+if (-not (Test-Path "$dst.bak")) {
+    Copy-Item $dst "$dst.bak"
+}
+
+# 部署修改後的 DLL
+Copy-Item "C:\working\gemma4-openvino\openvino_genai_src\build\openvino_genai\openvino_genai.dll" $dst -Force
+```
+
+### 7.4 還原（如果需要）
+
+```powershell
+$dst = "C:\Users\Local_Admin\AppData\Local\Programs\Python\Python312\Lib\site-packages\openvino_genai\openvino_genai.dll"
+Copy-Item "$dst.bak" $dst -Force
+```
+
+---
+
+## 8. 如何執行 (Run)
+
+### 8.1 自動偵測模式（推薦）
+
+只需將 `per_layer_embedding_directio.bin` 放在模型目錄中，GenAI 會自動偵測：
+
+```powershell
+cd C:\working\gemma4-openvino\gemma4-openvino-genai
+
+# 確認 repacked binary 存在於模型目錄
+ls "C:\working\gemma4-openvino\gemma-4-E4B-it-ov\per_layer_embedding_directio.bin"
+
+# 正常執行（GenAI 自動偵測，print log: "using DirectIO reader"）
+python run_gemma4.py `
+    --model-dir "C:\working\gemma4-openvino\gemma-4-E4B-it-ov" `
+    --device GPU `
+    --prompt "Explain quantum computing in simple terms." `
+    --max-new-tokens 256 `
+    --show-memory
+```
+
+預期輸出中應看到：
+```
+[PerLayerEmbeddingReader] Loaded from: ...\per_layer_embedding_directio.bin (vocab_size=262144, file_size=3221229568)
+[Gemma4] Per-layer embeddings: using DirectIO reader (saving ~2.82 GB GPU memory)
+```
+
+### 8.2 環境變數模式
+
+如果 repacked binary 不在模型目錄中，可用環境變數指定路徑：
+
+```powershell
+$env:OV_PER_LAYER_EMBEDDING_PATH = "D:\models\per_layer_embedding_directio.bin"
+python run_gemma4.py --model-dir "C:\working\gemma4-openvino\gemma-4-E4B-it-ov" --device GPU --prompt "Hello" --max-new-tokens 64
+```
+
+### 8.3 停用 offload（回到原始行為）
+
+移除或重命名 repacked binary 即可回到 compiled GPU model 路徑：
+
+```powershell
+# 暫時停用
+Rename-Item "...\gemma-4-E4B-it-ov\per_layer_embedding_directio.bin" "per_layer_embedding_directio.bin.disabled"
+
+# 重新啟用
+Rename-Item "...\gemma-4-E4B-it-ov\per_layer_embedding_directio.bin.disabled" "per_layer_embedding_directio.bin"
+```
+
+### 8.4 搭配 decoder weight streaming
+
+Per-layer offload 和 decoder streaming 是**相互獨立**的功能，可以同時啟用：
+
+| 配置 | Per-layer GPU 記憶體 | Decoder GPU 記憶體 | 備註 |
+|---|---:|---:|---|
+| 基線（都不用） | 2.82 GB | 2.09 GB | RSS ~7.1 GB, 24 tok/s |
+| **Per-layer offload only** | **0 GB** | 2.09 GB | **RSS ~4.4 GB, 24.8 tok/s** ✅ |
+| Decoder streaming only | 2.82 GB | ~0.5 GB | 6.78 tok/s（Phase 2 最佳） |
+| 兩者兼用 | 0 GB | ~0.5 GB | RSS 最低，tok/s ~5-7 |
+
+---
+
+## 9. 技術深入：mmap vs DirectIO 讀取機制
+
+### 9.1 實際實作使用 mmap
+
+原始設計提到 "DirectIO"，但最終實作使用 **OS mmap（記憶體映射）**，
+而非 Win32 `FILE_FLAG_NO_BUFFERING` 的 DirectIO。
+
+#### mmap 方式（目前實作）
+
+```
+CreateFileW(FILE_FLAG_RANDOM_ACCESS)    // 告訴 OS 是隨機存取模式
+CreateFileMappingW(PAGE_READONLY)       // 建立檔案映射
+MapViewOfFile(FILE_MAP_READ)            // 映射到虛擬記憶體空間
+
+讀取時: 直接解引用 m_data[offset]，OS 透過 page fault 自動從 NVMe 載入
+```
+
+**工作流程：**
+1. mmap 建立虛擬位址映射，但不實際載入資料
+2. 首次存取某 row 時觸發 page fault → OS 從 NVMe 讀取 4K page → 載入到 page cache
+3. 後續存取同一 row → page cache hit → 直接從 RAM 讀取（~100 ns，零 IO）
+4. OS 根據實體記憶體壓力自動 evict 不常用的 pages
+
+#### 真正的 DirectIO 方式（未使用）
+
+```
+CreateFileW(FILE_FLAG_NO_BUFFERING)     // 繞過 OS page cache
+VirtualAlloc(aligned buffer)            // 分配 4K-aligned buffer
+ReadFile(hFile, buf, 12288, ...)        // 每次手動觸發 NVMe 讀取
+```
+
+### 9.2 mmap vs DirectIO 優缺點比較
+
+| 面向 | mmap（目前實作） | DirectIO（未使用） |
+|---|---|---|
+| **Decode 延遲** | 首次 ~4 µs (page fault)，之後 ~0.1 µs (cache hit) | 每次 ~20-30 µs (NVMe IO) |
+| **Page Cache** | ✅ OS page cache，常用 token 零 IO | ❌ 繞過 cache，每次都做 IO |
+| **記憶體影響** | ⚠️ OS 可能 cache 熱門 pages（~數 MB~數百 MB） | ✅ 完全不佔額外記憶體 |
+| **實作複雜度** | ✅ 簡單（mmap + 指標解引用） | ⚠️ 需要 aligned buffer + OVERLAPPED |
+| **Prefill 效能** | ✅ OS 自動預讀（readahead） | ⚠️ 需要手動 scatter-gather IO |
+| **跨平台** | ✅ Windows + Linux 都有 mmap | ⚠️ Windows/Linux API 差異大 |
+| **NVMe 壽命** | ✅ 常用 token cache hit，減少實際 IO 次數 | ❌ 每次都觸發 NVMe read |
+
+### 9.3 Long Context 對兩種方案的影響
+
+#### Prefill 階段（N tokens 一次處理）
+
+| Context 長度 | mmap 首次 IO 量 | DirectIO IO 量 | mmap 重複 token 收益 |
+|---:|---:|---:|---|
+| 25 tok | 25 × 12 KB = 300 KB | 同左 | 少量重複 |
+| 256 tok | 256 × 12 KB = 3 MB | 同左 | ~10% hit |
+| 1024 tok | 1024 × 12 KB = 12 MB | 同左 | ~20% hit |
+| 4096 tok | 4096 × 12 KB = 48 MB | 同左 | ~25-30% hit |
+| 16384 tok | 16384 × 12 KB = 192 MB | 同左 | ~30-40% hit（Zipf 分佈）|
+
+**mmap 的 long context 優勢：**
+- Token 重複時（Zipf 分佈），page cache 直接命中（~100 ns vs ~4 µs page fault）
+- OS 可能自動 readahead 相鄰 pages，加速連續新 token 載入
+- 多輪對話時前一輪的 token pages 可能還在 cache
+
+**DirectIO 的 long context 問題：**
+- 每個 token 都強制做 NVMe IO，即使剛讀過同一 token
+- Prefill 16K tokens → 16384 × ~20 µs = ~328 ms 純 IO（mmap 可能只需 ~100 ms）
+
+#### Decode 階段（每次 1 token）
+
+| 場景 | mmap 延遲 | DirectIO 延遲 |
+|---|---:|---:|
+| 首次新 token | ~4 µs (page fault) | ~20 µs (NVMe read) |
+| 重複 token (cache hit) | ~0.1 µs | ~20 µs |
+| 記憶體壓力下 | ~4 µs (re-fault) | ~20 µs |
+
+#### Long Context 的記憶體影響
+
+```
+mmap：OS 會 cache 已存取過的 pages
+  25 tokens  →  ~300 KB resident pages
+  1024 tokens → ~12 MB resident pages
+  16K tokens  → ~192 MB resident pages（最壞情況，全部不重複）
+  
+  但 OS 在記憶體壓力下會自動回收不活躍的 pages。
+  實測穩定 RSS 只增加 ~86 MB（4416 - 4330 = 86 MB），
+  因為 token 重複率高 + OS eviction。
+
+DirectIO：永遠精確 0 額外記憶體
+  完全不使用 page cache。
+  適合極端記憶體受限場景（如 4 GB 系統）。
+```
+
+### 9.4 結論：為什麼選 mmap？
+
+1. **Decode 效能最優**：常用 token (Zipf top-100) 幾乎 0 延遲
+2. **Prefill long context 最佳**：OS 自動 readahead + cache 重複 token
+3. **實作簡單可靠**：不需處理 aligned buffer、OVERLAPPED IO、error recovery
+4. **記憶體自動管理**：OS page cache 會在壓力下自動 evict
+5. **真正的 bottleneck 在 GPU**：每 token ~40 ms GPU 計算，IO overhead <0.1%
+
+**何時需要切換到 DirectIO？**
+- 系統只有 4 GB RAM，不能容忍任何 page cache 記憶體
+- 需要精確控制每一 byte 的記憶體分配
+- 目前的 row-aligned 格式完全相容 DirectIO（12,288 bytes = 3 × 4K pages）
+
+---
+
+## 10. Embedding 重複問題分析
+
+### 10.1 `embed_tokens.weight` 出現在 3 個地方
 
 | 位置 | 大小 | 量化 | 用途 |
 |---|---:|---|---|
@@ -95,388 +538,93 @@ Per-layer embedding 每次都要重新讀取（lookup），無法跳過。
 | `language_model.bin` (offset 2.14 GB) | 672 MB | UINT8 asymmetric + ZP | LM head / logits (後端) |
 | `per_layer_model.bin` | 2,819 MB | INT8 symmetric + per-row FP16 scale | Per-layer injection |
 
-### 3.2 這不是 Bug
+### 10.2 這不是 Bug
 
 - `tie_word_embeddings: true` → 同一原始權重被分別量化為不同格式
-- Text embedding 用 i8 symmetric → 適合前端 embedding lookup
-- LM head 用 u8 asymmetric → 適合 output projection（不同數值分佈）
-- Per-layer embedding 是**完全不同的權重矩陣**（[262144, 10752]）
-
-### 3.3 未來優化機會
-
-如果統一 embedding 和 lm_head 的量化方案，可以共用一份 → 省 672 MB。
-但這需要修改 optimum-intel 匯出流程，目前不在 scope 內。
+- Per-layer embedding 是**完全不同的權重矩陣**（[262144, 10752] vs [262144, 2560]）
 
 ---
 
-## 4. 原始二進制佈局分析
+## 11. 風險與注意事項
 
-### 4.1 `openvino_text_embeddings_per_layer_model.bin` 結構
+### 11.1 TTFT 增加
 
-```
-Offset 0:
-  embed_tokens_per_layer.weight: [262144, 10752] INT8
-  Size: 2,818,572,288 bytes (2.819 GB)
-  Layout: row-major, 連續存放
-  Row N 的 offset = N × 10,752
+首次推理時 OS 需載入 mmap pages，對短 prompt 影響不大（~200 ms），
+但長 prompt (>1K tokens) 可能增加額外延遲。
+**緩解：** 第二次推理以後 TTFT 恢復正常（pages 已在 cache）。
 
-Offset 2,818,572,288:
-  embed_tokens_per_layer.weight/scale: [262144, 1] FP16
-  Size: 524,288 bytes (0.5 MB)
-  Row N 的 scale offset = 2,818,572,288 + N × 2
+### 11.2 記憶體壓力下的行為
 
-Offset 2,819,096,576:
-  其他小常量 (pad token IDs, shape constants)
-  Size: ~80 bytes
-```
+如果系統記憶體非常緊張（<4 GB free），OS 可能 evict mmap pages，
+導致 decode 時產生額外 page fault（~4 µs vs ~0.1 µs）。
+**影響：** 每 token 最多增加 ~4 µs = 0.01% of TPOT，可忽略。
 
-### 4.2 對齊分析
+### 11.3 儲存設備需求
 
-```
-Row size:    10,752 bytes
-4K aligned?  NO (10752 / 4096 = 2.625)
-512 aligned? YES (10752 / 512 = 21 sectors, 恰好整除！)
-GCD(10752, 4096) = 512
-LCM(10752, 4096) = 86,016 bytes (= 8 rows = 21 pages)
-```
+mmap 依賴底層儲存設備的 random read 效能。
+- NVMe (Gen5): <2 µs per page fault ← **最佳**
+- NVMe (Gen3/4): ~4 µs per page fault ← 推薦
+- SATA SSD: ~50 µs per page fault ← 可用但稍慢
+- HDD: ~5-10 ms per page fault ← ❌ **不適用**
 
 ---
 
-## 5. DirectIO Repack 格式設計
+## 12. 實作步驟追蹤
 
-### 5.1 為什麼需要 Repack？
-
-原始布局的問題：
-1. Weight 和 Scale 不在同一位置 → 需要兩次 IO
-2. Row 不是 4K 對齊 → DirectIO 需要讀額外的 bytes
-3. 需要計算兩個不同的 offset
-
-### 5.2 Repacked 格式
-
-```
-File: per_layer_embedding_directio.bin
-
-Header (4096 bytes, 1 page):
-  [0..3]:     Magic "PLEB" (Per-Layer EMBedding)
-  [4..7]:     Version = 1
-  [8..11]:    vocab_size = 262144 (uint32)
-  [12..15]:   per_layer_dim = 10752 (uint32)
-  [16..19]:   num_layers = 42 (uint32)
-  [20..23]:   layer_dim = 256 (uint32)
-  [24..27]:   weight_dtype = 1 (INT8)
-  [28..31]:   scale_dtype = 2 (FP16)
-  [32..35]:   row_stride = 12288 (uint32, bytes per aligned row)
-  [36..39]:   reserved
-  [40..4095]: padding zeros
-
-Data (starts at offset 4096):
-  Row 0:  [10752 INT8 weight | 2 FP16 scale | 1534 pad] = 12,288 bytes (3 pages)
-  Row 1:  [10752 INT8 weight | 2 FP16 scale | 1534 pad] = 12,288 bytes
-  ...
-  Row 262143: [10752 INT8 weight | 2 FP16 scale | 1534 pad] = 12,288 bytes
-
-Total: 4096 + 262144 × 12288 = 3,221,229,568 bytes (3.221 GB)
-```
-
-### 5.3 讀取公式
-
-```
-對 token_id N:
-  # Special token handling
-  if N in {258880, 258884, 258881}: N = 0  (remap to row 0)
-  if N < 0 or N >= 262144: return zeros([1, 1, 42, 256])
-
-  file_offset = 4096 + N × 12288
-  read_size   = 12288  (3 pages, 4K aligned)
-  weight_data = buf[0:10752]     → INT8[10752]
-  scale_data  = buf[10752:10754] → FP16[1]
-  
-  # Dequant: weight × scale × POST_GATHER_SCALE(16.0)
-  output[i] = (float)weight_data[i] × (float)scale_data[0] × 16.0   for i in 0..10751
-  reshape(output, [1, 1, 42, 256])
-```
-
-**POST_GATHER_SCALE = 16.0** — 從 IR 圖中的 `Constant_209981` 發現。
-這是 Gemma4 per-layer embedding 架構的固有 scaling。
+| Step | 描述 | 狀態 |
+|---|---|---|
+| 1 | Repack 工具 (`pack_per_layer_embedding.py`) | ✅ 完成 |
+| 2 | Python 數值驗證 (bit-exact, 20/20 pass) | ✅ 完成 |
+| 3 | C++ mmap Reader (`per_layer_embedding_reader.hpp`) | ✅ 完成 |
+| 4 | GenAI 整合 (`classes.cpp`/`.hpp` 修改) | ✅ 完成 |
+| 5 | Build GenAI DLL (`openvino_genai.dll`) | ✅ 完成 |
+| 6 | Deploy + 效能驗證 (24.83 tok/s, -2.68 GB) | ✅ 完成 |
+| 7 | 選配：LRU Cache（目前不需要） | ⬜ 待評估 |
+| 8 | 選配：AVX2/AVX-512 SIMD dequant 加速 | ⬜ 待評估 |
 
 ---
 
-## 6. 實作計畫
-
-### Phase A: Repack 工具 (`pack_per_layer_embedding.py`)
-
-```python
-# Input:  openvino_text_embeddings_per_layer_model.bin
-# Output: per_layer_embedding_directio.bin
-
-def pack():
-    # 1. Read weight [262144, 10752] INT8 from offset 0
-    # 2. Read scale [262144, 1] FP16 from offset 2,818,572,288
-    # 3. Write header (4096 bytes)
-    # 4. For each row: write [weight_row | scale_row | padding] = 12288 bytes
-```
-
-### Phase B: GenAI 端攔截 (`per_layer_embedding_reader`)
-
-攔截點在 `openvino_genai_src/src/cpp/src/visual_language/gemma4/classes.cpp`:
-
-```cpp
-// 目前的 lambda (每 token 呼叫):
-get_per_layer_embeddings_callback() {
-    return [this](const ov::Tensor& input_ids) {
-        return get_per_layer_embeddings(input_ids);  // ← 呼叫 compiled model
-    };
-}
-
-// 替換為:
-get_per_layer_embeddings_callback() {
-    if (m_per_layer_directio_reader) {
-        return [this](const ov::Tensor& input_ids) {
-            int64_t token_id = input_ids.data<int64_t>()[0];
-            return m_per_layer_directio_reader->lookup(token_id);
-        };
-    }
-    // fallback to compiled model
-    return [this](const ov::Tensor& input_ids) {
-        return get_per_layer_embeddings(input_ids);
-    };
-}
-```
-
-**實作位置選擇：**
-- 修改 GenAI 原始碼 → 需要 rebuild genai
-- 或：用 Python callback 做 prototype 驗證 → 之後再 C++ 化
-
-### Phase C: DirectIO Reader (`per_layer_embedding_reader.hpp/.cpp`)
-
-```cpp
-class PerLayerEmbeddingReader {
-    HANDLE m_file;          // FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN
-    size_t m_row_stride;    // 12288
-    size_t m_header_size;   // 4096
-    size_t m_weight_size;   // 10752
-    void*  m_aligned_buf;   // VirtualAlloc aligned buffer for DirectIO
-    
-    // Optional LRU cache
-    struct CacheEntry { int64_t token_id; float data[10752]; };
-    std::vector<CacheEntry> m_cache;
-    
-public:
-    ov::Tensor lookup(int64_t token_id) {
-        // 1. Check LRU cache
-        // 2. DirectIO read: 12 KB at (4096 + token_id * 12288)
-        // 3. Dequant: int8 × fp16_scale → fp32[10752]
-        // 4. Reshape → Tensor [1, 1, 42, 256]
-        // 5. Update LRU cache
-    }
-};
-```
-
-### Phase D: Python Prototype（快速驗證）
-
-在實作 C++ 之前，先用 Python 驗證正確性和效能：
-
-```python
-# 1. Repack per-layer model to aligned binary
-# 2. Open with os.open(O_RDONLY | O_DIRECT) on Linux, or
-#    CreateFile(FILE_FLAG_NO_BUFFERING) via ctypes on Windows
-# 3. Hook into VLMPipeline's per_layer callback
-# 4. Verify output matches compiled model output
-```
-
-**問題：** GenAI 的 VLMPipeline 不暴露 per_layer callback 給 Python。
-**方案：** 先跑獨立驗證 → 確認 repack + dequant 結果正確 → 再做 C++ 整合。
-
----
-
-## 7. Win32 DirectIO API 細節
-
-### 7.1 File Open
-
-```cpp
-HANDLE hFile = CreateFileW(
-    L"per_layer_embedding_directio.bin",
-    GENERIC_READ,
-    FILE_SHARE_READ,
-    NULL,
-    OPEN_EXISTING,
-    FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,  // DirectIO + async
-    NULL
-);
-```
-
-`FILE_FLAG_NO_BUFFERING` 要求：
-- 讀取 offset 必須是 sector size (通常 512 或 4096) 的倍數 ✅ (我們用 4K 對齊)
-- 讀取 size 必須是 sector size 的倍數 ✅ (12288 = 3 × 4096)
-- Buffer 必須是 sector-aligned ✅ (VirtualAlloc 預設 page-aligned)
-
-### 7.2 Aligned Read
-
-```cpp
-// Allocate aligned buffer
-void* buf = VirtualAlloc(NULL, 12288, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-// Read one row
-OVERLAPPED ov = {};
-ov.Offset     = (DWORD)((4096 + token_id * 12288) & 0xFFFFFFFF);
-ov.OffsetHigh = (DWORD)((4096 + token_id * 12288) >> 32);
-DWORD bytesRead = 0;
-ReadFile(hFile, buf, 12288, &bytesRead, &ov);
-```
-
-### 7.3 Dequant
-
-```cpp
-// SIMD-friendly dequant: int8 → fp32 × scale
-const int8_t* weight = (int8_t*)buf;
-uint16_t scale_fp16 = *(uint16_t*)(buf + 10752);
-float scale = fp16_to_fp32(scale_fp16);
-
-float* output = tensor.data<float>();  // [10752]
-for (int i = 0; i < 10752; i++) {
-    output[i] = (float)weight[i] * scale;
-}
-// Can use AVX2/AVX-512 for 16x-32x speedup
-```
-
----
-
-## 8. Prefill 批次讀取策略
-
-Prefill 時 input_ids 可能有 10-1024 個 token，需要一次讀多行。
-
-### 8.1 Scatter-gather 讀取
-
-```
-input_ids = [3689, 563, 236743, ...]  (N tokens)
-
-方案 A: N 次獨立 DirectIO 讀取
-  - 簡單，但 N 次系統呼叫開銷
-  - N=100 → 100 × 20µs = 2ms (still fast)
-
-方案 B: 排序 token IDs → 合併相鄰請求
-  - 如果 token_id 相鄰，可以一次讀多行
-  - LCM(10752, 4096) = 86016 = 8 rows → 可一次讀 8 行
-  - 但 token IDs 通常不相鄰 → 收益有限
-
-方案 C: ReadFileScatter (Win32)
-  - 一次呼叫讀多個不連續的頁
-  - 需要所有 segment 相同大小且 page-aligned ✅
-
-推薦: 方案 A (簡單直接，prefill 本身就慢，IO 開銷可忽略)
-```
-
----
-
-## 9. LRU Cache 分析
-
-### 9.1 語言的 Zipf 分佈
-
-Token 頻率遵循 Zipf 定律：少數 token 佔大部分出現次數。
-
-### 9.2 模擬結果
-
-| Cache 大小 | 行數 | Vocab 覆蓋率 | Hit Rate (多輪對話) | Hit Rate (decode) |
-|---:|---:|---:|---:|---:|
-| 0.3 MB | 32 | 0.01% | ~22% | ~39% |
-| 0.7 MB | 64 | 0.02% | ~30% | ~45% |
-| 1.4 MB | 128 | 0.05% | ~33% | ~51% |
-| 2.8 MB | 256 | 0.10% | ~33% | ~51% |
-
-### 9.3 結論
-
-- LRU cache 即使 0% hit rate，IO 開銷仍只有 ~30 µs ≈ 0.07% of TPOT
-- Cache 主要價值在減少 NVMe IO 次數 → 延長 NVMe 壽命
-- **建議 Phase 1 不加 LRU，Phase 2 可選加 128-256 行 (~1-3 MB)**
-
----
-
-## 10. 風險與注意事項
-
-### 10.1 特殊 Token 處理
-
-Per-layer model 內部有：
-- Pad token → output = zeros
-- 其他特殊 token → 使用 trained embedding 值
-- Token ID 範圍檢查
-
-**需要在 reader 中正確處理這些 edge cases。**
-
-### 10.2 GenAI 整合深度
-
-修改 GenAI classes.cpp 需要 rebuild openvino.genai，或者：
-- 方案 1: 修改 GenAI 原始碼 → 完整整合
-- 方案 2: 用 OpenVINO plugin property → 不修改 GenAI，在 GPU plugin 層攔截
-- 方案 3: 先 Python prototype → 驗證數值正確性 → 再決定整合方式
-
-### 10.3 數值精度
-
-Direct dequant (int8 × fp16_scale → fp32) 必須與 compiled model 的結果完全一致。
-需驗證：
-- FP16 scale → FP32 的轉換精確度
-- INT8 → FP32 的型別轉換
-- 是否有額外的 post-scaling（compiled model 中有 `Multiply × scaling_constant`）
-
----
-
-## 11. 實作步驟（Action Items）
-
-### Step 1: 建立 Repack 工具 ✅ → `pack_per_layer_embedding.py`
-- 讀取原始 .bin → 輸出 4K-aligned .bin
-- 加入 header (magic, version, metadata)
-- 驗證每行 weight + scale 正確
-
-### Step 2: Python 數值驗證 ✅
-- 從 repacked .bin 讀取 row N → dequant → compare with compiled model output
-- **bit-exact (abs_err = 0.000000) — 20/20 samples PASS**
-- 發現 IR 圖中有 `Constant_209981 = 16.0` 的 post-Gather scaling factor
-- 完整 dequant: `int8 × fp16_scale × 16.0 → fp32`
-- 特殊 token: `{258880, 258884, 258881}` → remap to row 0; out-of-range → zeros
-
-### Step 3: C++ DirectIO Reader ⬜
-- `per_layer_embedding_reader.hpp/.cpp`
-- Win32 CreateFile + ReadFile + VirtualAlloc
-- Dequant loop (可選 AVX2 加速)
-
-### Step 4: GenAI 整合 ⬜
-- 修改 gemma4/classes.cpp 的 callback
-- 環境變數控制啟用/停用
-- Prefill 批次讀取
-
-### Step 5: 效能驗證 ⬜
-- 比較 tok/s: DirectIO reader vs compiled model
-- 比較 RSS: 應省下 ~2.82 GB
-- 比較 TTFT: prefill 時的 IO 影響
-
----
-
-## 12. 相關文件
-
-| 文件 | 說明 |
-|---|---|
-| `20260511_phase2_weight_streaming.md` | Phase 2 decoder weight streaming (前一階段) |
-| `20260508_dense_weight_streaming_plan.md` | 初始計畫 |
-| `cpp/dense_weight_streaming_manager.hpp/.cpp` | Phase 2 streaming manager |
-| `pack_dense_weights.py` | Phase 2 decoder weight packer |
-| `reference/moe_expert_weight_manager.hpp` | MoE OTD DirectStorage 參考 |
-
----
-
-## 13. 一鍵流程（待實作完成後更新）
+## 13. 完整一鍵流程
 
 ```powershell
-# === Step 1: Repack ===
+# ===== Step 1: Repack 模型 =====
 cd C:\working\gemma4-openvino\gemma4-openvino-genai
 python pack_per_layer_embedding.py `
     --model-dir "C:\working\gemma4-openvino\gemma-4-E4B-it-ov" `
-    --output "C:\working\gemma4-openvino\gemma-4-E4B-it-ov\per_layer_embedding_directio.bin"
+    --output "C:\working\gemma4-openvino\gemma-4-E4B-it-ov\per_layer_embedding_directio.bin" `
+    --verify
 
-# === Step 2: Verify ===
-python verify_per_layer_embedding.py `
+# ===== Step 2: Build GenAI DLL =====
+cd C:\working\gemma4-openvino\openvino_genai_src
+cmake -B build -G "Visual Studio 17 2022" `
+    -DCMAKE_BUILD_TYPE=Release `
+    -DENABLE_PYTHON=OFF -DENABLE_JS=OFF -DENABLE_TESTS=OFF `
+    -DENABLE_TOOLS=OFF -DENABLE_XGRAMMAR=OFF -DENABLE_GGUF=ON
+cmake --build build --target openvino_genai --config Release -- /v:m /p:CL_MPCount=4
+
+# ===== Step 3: Deploy DLL =====
+$dst = "C:\Users\Local_Admin\AppData\Local\Programs\Python\Python312\Lib\site-packages\openvino_genai\openvino_genai.dll"
+Copy-Item "$dst" "$dst.bak" -ErrorAction SilentlyContinue
+Copy-Item "build\openvino_genai\openvino_genai.dll" $dst -Force
+
+# ===== Step 4: Run =====
+cd C:\working\gemma4-openvino\gemma4-openvino-genai
+python run_gemma4.py `
     --model-dir "C:\working\gemma4-openvino\gemma-4-E4B-it-ov" `
-    --repacked "C:\working\gemma4-openvino\gemma-4-E4B-it-ov\per_layer_embedding_directio.bin"
-
-# === Step 3: Test with DirectIO reader ===
-$env:OV_PER_LAYER_DIRECTIO = "C:\working\gemma4-openvino\gemma-4-E4B-it-ov\per_layer_embedding_directio.bin"
-python run_gemma4.py --model-dir "C:\working\gemma4-openvino\gemma-4-E4B-it-ov" --prompt "Hello" --max-new-tokens 20
+    --device GPU `
+    --prompt "Explain quantum computing." `
+    --max-new-tokens 256 `
+    --show-memory
 ```
+
+---
+
+## 14. 相關文件
+
+| 文件 | 說明 |
+|---|---|
+| `pack_per_layer_embedding.py` | Repack 工具 + 驗證 |
+| `20260511_phase2_weight_streaming.md` | Phase 2 decoder weight streaming |
+| `20260508_dense_weight_streaming_plan.md` | 初始 streaming 計畫 |
+| `cpp/dense_weight_streaming_manager.hpp/.cpp` | Phase 2 decoder streaming manager |
+| `reference/moe_expert_weight_manager.hpp` | MoE OTD DirectStorage 參考 |

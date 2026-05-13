@@ -44,20 +44,20 @@ if ($missing.Count -gt 0) {
 
 # ── Clean and create output structure ────────────────────────
 if (Test-Path $OutputDir) { Remove-Item $OutputDir -Recurse -Force }
-$dirs = @("bin", "runtime", "model", "scripts")
+$dirs = @("bin", "runtime", "model", "scripts", "streaming")
 foreach ($d in $dirs) {
     New-Item -ItemType Directory -Force -Path (Join-Path $OutputDir $d) | Out-Null
 }
-Write-Host "[1/6] Output directory: $OutputDir" -ForegroundColor Cyan
+Write-Host "[1/7] Output directory: $OutputDir" -ForegroundColor Cyan
 
 # ── bin/ : exe + genai DLLs ──────────────────────────────────
-Write-Host "[2/6] Copying executables and GenAI DLLs ..." -ForegroundColor Cyan
+Write-Host "[2/7] Copying executables and GenAI DLLs ..." -ForegroundColor Cyan
 Copy-Item "$ExeDir\run_gemma4.exe" (Join-Path $OutputDir "bin") -Force
 Copy-Item "$GenAiBuild\openvino_genai.dll" (Join-Path $OutputDir "bin") -Force
 Copy-Item "$GenAiBuild\openvino_tokenizers.dll" (Join-Path $OutputDir "bin") -Force
 
 # ── runtime/ : OpenVINO core DLLs (GPU essential only) ───────
-Write-Host "[3/6] Copying OpenVINO runtime DLLs ..." -ForegroundColor Cyan
+Write-Host "[3/7] Copying OpenVINO runtime DLLs ..." -ForegroundColor Cyan
 $ovDlls = @(
     "openvino.dll",
     "openvino_c.dll",
@@ -82,7 +82,7 @@ foreach ($dll in $ovDlls) {
 }
 
 # ── model/ : IR files + revised per-layer embedding ──────────
-Write-Host "[4/6] Copying model files ..." -ForegroundColor Cyan
+Write-Host "[4/7] Copying model files ..." -ForegroundColor Cyan
 $modelFiles = @(
     # Language model (decoder)
     "openvino_language_model.xml",
@@ -119,9 +119,22 @@ foreach ($f in $modelFiles) {
     }
 }
 
-# ── scripts/ : Python test scripts ───────────────────────────
-Write-Host "[5/6] Copying test scripts ..." -ForegroundColor Cyan
-$scripts = @("run_gemma4.py", "benchmark.py")
+# ── streaming/ : Dense weight streaming binary + metadata ────
+Write-Host "[5/7] Copying dense weight streaming files ..." -ForegroundColor Cyan
+$StreamingDir = "C:\working\gemma4-openvino\gemma4-openvino-genai\temp"
+$streamingFiles = @("dense_weights_streaming.bin", "dense_weights_streaming.json")
+foreach ($f in $streamingFiles) {
+    $src = Join-Path $StreamingDir $f
+    if (Test-Path $src) {
+        Copy-Item $src (Join-Path $OutputDir "streaming") -Force
+    } else {
+        Write-Warning "  Skipped (not found): $f — run pack_dense_weights.py first"
+    }
+}
+
+# ── scripts/ : Python test scripts + packing tool ────────────
+Write-Host "[6/7] Copying scripts ..." -ForegroundColor Cyan
+$scripts = @("run_gemma4.py", "benchmark.py", "pack_dense_weights.py")
 foreach ($s in $scripts) {
     $src = Join-Path $ScriptDir $s
     if (Test-Path $src) {
@@ -130,7 +143,7 @@ foreach ($s in $scripts) {
 }
 
 # ── setupvars.bat + README ───────────────────────────────────
-Write-Host "[6/6] Creating setupvars.bat and README ..." -ForegroundColor Cyan
+Write-Host "[7/7] Creating setupvars.bat and README ..." -ForegroundColor Cyan
 
 $setupvarsBat = @'
 @echo off
@@ -156,7 +169,11 @@ echo [setupvars] Gemma4 OpenVINO GenAI environment initialized
 echo   Binaries : %BIN_DIR%
 echo   Runtime  : %RT_DIR%
 echo.
-echo Usage:
+echo Usage (normal):
+echo   run_gemma4.exe --model-dir model --prompt "Hello" --no-mmap --show-memory
+echo.
+echo Usage (dense weight streaming - for 8GB systems):
+echo   set OV_DENSE_STREAM_WEIGHTS=%SCRIPT_DIR%\streaming\dense_weights_streaming.bin
 echo   run_gemma4.exe --model-dir model --prompt "Hello" --no-mmap --show-memory
 echo.
 '@
@@ -196,10 +213,29 @@ gemma4-release/
 │   ├── openvino_language_model.xml/.bin
 │   ├── openvino_text_embeddings_per_layer_model_revised.bin
 │   └── ...
-├── scripts/                 Python test scripts
+├── streaming/               Dense weight streaming (for 8GB systems)
+│   ├── dense_weights_streaming.bin   (~1.55 GB, decoder FC weights)
+│   └── dense_weights_streaming.json  (metadata)
+├── scripts/                 Python scripts & tools
+│   ├── run_gemma4.py
+│   ├── benchmark.py
+│   └── pack_dense_weights.py
 ├── setupvars.bat            Environment setup
 └── README.md
 ```
+
+## Dense Weight Streaming (for memory-constrained systems)
+
+Enable dense weight streaming for systems with limited RAM (e.g. 8 GB):
+
+```cmd
+call setupvars.bat
+set OV_DENSE_STREAM_WEIGHTS=%CD%\streaming\dense_weights_streaming.bin
+run_gemma4.exe --model-dir model --prompt "Hello" --no-mmap --show-memory
+```
+
+This streams decoder FC weights from NVMe instead of loading them all into GPU memory.
+Performance: ~6.78 tok/s (vs 24 tok/s baseline). Memory savings: ~845 MB.
 
 ## Command-Line Options
 
@@ -243,14 +279,16 @@ Write-Host "================================================" -ForegroundColor G
 $binSize = (Get-ChildItem (Join-Path $OutputDir "bin") -Recurse | Measure-Object Length -Sum).Sum / 1MB
 $rtSize  = (Get-ChildItem (Join-Path $OutputDir "runtime") -Recurse | Measure-Object Length -Sum).Sum / 1MB
 $mdlSize = (Get-ChildItem (Join-Path $OutputDir "model") -Recurse | Measure-Object Length -Sum).Sum / 1MB
+$stmSize = (Get-ChildItem (Join-Path $OutputDir "streaming") -Recurse -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB
 $totalSize = (Get-ChildItem $OutputDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
 
 Write-Host ""
 Write-Host "  Directory: $OutputDir"
-Write-Host "  bin/     : $([math]::Round($binSize, 1)) MB"
-Write-Host "  runtime/ : $([math]::Round($rtSize, 1)) MB"
-Write-Host "  model/   : $([math]::Round($mdlSize, 1)) MB"
-Write-Host "  TOTAL    : $([math]::Round($totalSize, 1)) MB"
+Write-Host "  bin/       : $([math]::Round($binSize, 1)) MB"
+Write-Host "  runtime/   : $([math]::Round($rtSize, 1)) MB"
+Write-Host "  model/     : $([math]::Round($mdlSize, 1)) MB"
+Write-Host "  streaming/ : $([math]::Round($stmSize, 1)) MB"
+Write-Host "  TOTAL      : $([math]::Round($totalSize, 1)) MB"
 Write-Host ""
 
 # List all files

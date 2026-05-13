@@ -1,0 +1,58 @@
+[DenseStreaming] Initializing from C:\working\gemma4-openvino\gemma-4-E4B-it-ov\dense_weights_streaming.bin (network has 1180 primitives)
+[DenseStreaming] Cannot open file: C:\working\gemma4-openvino\gemma-4-E4B-it-ov\dense_weights_streaming.bin
+[DenseStreaming] ERROR: Failed to read file header.
+[DenseStreaming] Failed to initialize!
+[PerLayerEmbeddingReader] Loaded from: C:\working\gemma4-openvino\gemma-4-E4B-it-ov\per_layer_embedding_directio.bin (mode=directio, vocab_size=262144, file_size=3221229568)
+[Gemma4] Per-layer embeddings: using directio reader (saving ~2.82 GB GPU memory)
+
+  [Before loading]  RSS: 58 MB  |  Peak: 58 MB
+Loading VLMPipeline from C:\working\gemma4-openvino\gemma-4-E4B-it-ov on GPU...
+  (mmap disabled — weights will be copied into RAM)
+Model loaded in 9.6s
+  [After loading (peak)]  RSS: 4,326 MB  |  Peak: 7,563 MB
+
+Prompt: Hello
+
+Response: [DenseStreaming] Skipping network with 4 primitives (not a decoder network)
+[DenseStreaming] Initializing from C:\working\gemma4-openvino\gemma-4-E4B-it-ov\dense_weights_streaming.bin (network has 2549 primitives)
+[DenseStreaming] Cannot open file: C:\working\gemma4-openvino\gemma-4-E4B-it-ov\dense_weights_streaming.bin
+[DenseStreaming] ERROR: Failed to read file header.
+[DenseStreaming] Failed to initialize!
+Hello! How can I help you today?
+
+  [After generation (stabilized)]  RSS: 4,361 MB  |  Peak: 7,563 MB
+
+------------------------------------------------------------
+  OpenVINO GenAI — Performance Metrics
+------------------------------------------------------------
+  Input tokens          : 10
+  Generated tokens      : 10
+
+  Load time             : 9540.00 ms
+  TTFT                  : 915.53 ms
+  TPOT                  : 50.34 ms
+
+  Throughput            : 19.86 tok/s
+
+  Generate duration     : 1369.38 ms
+  Inference duration    : 755.32 ms
+  Tokenization duration : 478.74 ms
+  Detokenization dur.   : 0.16 ms
+------------------------------------------------------------
+onednn_verbose,v1,info,oneDNN v3.12.0 (commit 20db47e2d3c4df1b66e93bed2e97d30da175512d)
+onednn_verbose,v1,info,gpu,runtime:OpenCL
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,info,gpu,engine,opencl device count:2 
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,common,error,runtime,no opencl gpu device is available,src\xpu/ocl/engine_factory.hpp:64
+onednn_verbose,v1,common,error,ocl,invalid gpu device in environment: index 0,src\xpu/ocl/verbose.hpp:46
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,common,error,runtime,no opencl gpu device is available,src\xpu/ocl/engine_factory.hpp:64
+onednn_verbose,v1,common,error,ocl,invalid gpu device in environment: index 1,src\xpu/ocl/verbose.hpp:46
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,primitive,info,template:operation,engine,primitive,implementation,prop_kind,memory_descriptors,attributes,auxiliary,problem_desc,exec_time
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu/ocl/utils.hpp:189,src\xpu/ocl/utils.hpp:189
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu/ocl/utils.hpp:259,src\xpu/ocl/utils.hpp:259

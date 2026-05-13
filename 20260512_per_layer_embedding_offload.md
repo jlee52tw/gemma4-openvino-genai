@@ -45,6 +45,55 @@ GPU 記憶體中，達到：
 排程 decoder layers 的計算。此外 per-layer embedding lookup 的 CPU dequant
 只需 ~10-30 µs（vs GPU 端 ~42 ms compute），overhead 完全可忽略。
 
+### 2.4 mmap vs DirectIO 完整 Benchmark（2026-05-13 實測）
+
+**測試條件：** text-only, ENABLE_MMAP='NO', 64 output tokens, GPU device, 單次不含 warmup
+
+#### mmap 模式結果
+
+| Input Tokens | TTFT (ms) | TPOT (ms) | TPS | Wall (s) | RSS (MB) | Peak RSS (MB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 850.8 | 42.4 | 23.6 | 3.5 | 4,514 | 7,550 |
+| 1,024 | 1,002.1 | 48.0 | 20.8 | 4.0 | 4,983 | 7,550 |
+| 2,048 | 1,159.5 | 55.8 | 17.9 | 4.7 | 5,724 | 7,550 |
+| 4,096 | 2,334.2 | 74.7 | 13.4 | 7.0 | 6,858 | 7,550 |
+| 8,192 | 8,091.9 | 121.5 | 8.2 | 15.8 | 8,153 | 11,747 |
+
+#### DirectIO 模式結果
+
+| Input Tokens | TTFT (ms) | TPOT (ms) | TPS | Wall (s) | RSS (MB) | Peak RSS (MB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 819.2 | 42.8 | 23.4 | 3.5 | 4,510 | 7,547 |
+| 1,024 | 1,032.7 | 47.9 | 20.9 | 4.0 | 4,979 | 7,547 |
+| 2,048 | 1,280.5 | 56.0 | 17.9 | 4.8 | 5,719 | 7,547 |
+| 4,096 | 2,637.8 | 75.2 | 13.3 | 7.4 | 6,836 | 7,547 |
+| 8,192 | 9,812.2 | 125.3 | 8.0 | 17.7 | 8,144 | 11,732 |
+
+#### 模式比較分析
+
+| Input Tokens | mmap TPS | DirectIO TPS | 差異 | mmap TTFT | DirectIO TTFT | 差異 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 23.6 | 23.4 | -0.8% | 850.8 | 819.2 | -3.7% ✅ |
+| 1,024 | 20.8 | 20.9 | +0.5% | 1,002.1 | 1,032.7 | +3.1% |
+| 2,048 | 17.9 | 17.9 | 0.0% | 1,159.5 | 1,280.5 | +10.4% |
+| 4,096 | 13.4 | 13.3 | -0.7% | 2,334.2 | 2,637.8 | +13.0% |
+| 8,192 | 8.2 | 8.0 | -2.4% | 8,091.9 | 9,812.2 | +21.3% |
+
+**結論：**
+
+1. **Decode 吞吐量 (TPS/TPOT)：兩種模式幾乎完全相同。** 差異在 0-2% 內，屬於正常測量誤差。
+   Decode 階段每 token 只需讀取 1 row = 12,288 bytes，CPU cache 命中率高，IO 模式無影響。
+
+2. **TTFT (Prefill)：mmap 在長 context 下略優於 DirectIO。** 8K tokens 時 mmap 快 21%（8.1s vs 9.8s），
+   因為 OS 的 readahead 機制會預讀後續 pages，而 DirectIO 逐行讀取產生更多系統呼叫開銷。
+
+3. **記憶體用量：兩者幾乎一致。** RSS 和 Peak RSS 差距 <1%。
+   mmap 的 mapped pages 不計入 RSS（OS file cache），DirectIO 使用 VirtualAlloc 固定 buffer（12 KB）。
+
+4. **推薦：繼續使用 mmap 模式作為預設值。** DirectIO 未帶來預期的 page cache bypass 優勢，
+   因為 per-layer embedding 的 IO 量太小（每 token 12 KB），OS file cache 可以完美處理。
+   DirectIO 的價值在於未來 decoder weight streaming（每 step 需讀取 ~2 GB），而非 embedding offload。
+
 ---
 
 ## 3. 使用的模型檔案
@@ -579,8 +628,10 @@ mmap 依賴底層儲存設備的 random read 效能。
 | 4 | GenAI 整合 (`classes.cpp`/`.hpp` 修改) | ✅ 完成 |
 | 5 | Build GenAI DLL (`openvino_genai.dll`) | ✅ 完成 |
 | 6 | Deploy + 效能驗證 (24.83 tok/s, -2.68 GB) | ✅ 完成 |
-| 7 | 選配：LRU Cache（目前不需要） | ⬜ 待評估 |
-| 8 | 選配：AVX2/AVX-512 SIMD dequant 加速 | ⬜ 待評估 |
+| 7 | DirectIO 雙模式 + 環境變數切換 | ✅ 完成 |
+| 8 | mmap vs DirectIO Benchmark (5 token lengths) | ✅ 完成 |
+| 9 | 選配：LRU Cache（目前不需要） | ⬜ 待評估 |
+| 10 | 選配：AVX2/AVX-512 SIMD dequant 加速 | ⬜ 待評估 |
 
 ---
 
@@ -624,6 +675,7 @@ python run_gemma4.py `
 | 文件 | 說明 |
 |---|---|
 | `pack_per_layer_embedding.py` | Repack 工具 + 驗證 |
+| `benchmark_embedding_io.py` | mmap vs DirectIO IO 模式 benchmark |
 | `20260511_phase2_weight_streaming.md` | Phase 2 decoder weight streaming |
 | `20260508_dense_weight_streaming_plan.md` | 初始 streaming 計畫 |
 | `cpp/dense_weight_streaming_manager.hpp/.cpp` | Phase 2 decoder streaming manager |

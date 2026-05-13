@@ -1,0 +1,78 @@
+{
+  "timestamp": "2026-05-13T09:40:33.648969",
+  "model_dir": "C:\\working\\gemma4-openvino\\gemma-4-E4B-it-ov",
+  "device": "GPU",
+  "max_new_tokens": 64,
+  "results": [
+    {
+      "label": "directio/256tok",
+      "input_tokens": 265,
+      "output_tokens": 64,
+      "ttft_ms": 819.16,
+      "tpot_ms": 42.83,
+      "throughput_tps": 23.35,
+      "generate_ms": 3517.82,
+      "inference_ms": 3214.41,
+      "wall_time_s": 3.52,
+      "rss_before_mb": 4329.0,
+      "rss_after_mb": 4510.0,
+      "peak_rss_mb": 7547.0
+    },
+    {
+      "label": "directio/1024tok",
+      "input_tokens": 1033,
+      "output_tokens": 64,
+      "ttft_ms": 1032.73,
+      "tpot_ms": 47.93,
+      "throughput_tps": 20.86,
+      "generate_ms": 4052.96,
+      "inference_ms": 3788.32,
+      "wall_time_s": 4.05,
+      "rss_before_mb": 4510.0,
+      "rss_after_mb": 4979.0,
+      "peak_rss_mb": 7547.0
+    },
+    {
+      "label": "directio/2048tok",
+      "input_tokens": 2057,
+      "output_tokens": 64,
+      "ttft_ms": 1280.46,
+      "tpot_ms": 56.04,
+      "throughput_tps": 17.85,
+      "generate_ms": 4811.58,
+      "inference_ms": 4459.91,
+      "wall_time_s": 4.81,
+      "rss_before_mb": 4979.0,
+      "rss_after_mb": 5719.0,
+      "peak_rss_mb": 7547.0
+    },
+    {
+      "label": "directio/4096tok",
+      "input_tokens": 4105,
+      "output_tokens": 64,
+      "ttft_ms": 2637.76,
+      "tpot_ms": 75.18,
+      "throughput_tps": 13.3,
+      "generate_ms": 7376.67,
+      "inference_ms": 6840.95,
+      "wall_time_s": 7.38,
+      "rss_before_mb": 5719.0,
+      "rss_after_mb": 6836.0,
+      "peak_rss_mb": 7547.0
+    },
+    {
+      "label": "directio/8192tok",
+      "input_tokens": 8201,
+      "output_tokens": 64,
+      "ttft_ms": 9812.22,
+      "tpot_ms": 125.29,
+      "throughput_tps": 7.98,
+      "generate_ms": 17708.94,
+      "inference_ms": 16734.05,
+      "wall_time_s": 17.71,
+      "rss_before_mb": 6836.0,
+      "rss_after_mb": 8144.0,
+      "peak_rss_mb": 11732.0
+    }
+  ]
+}

@@ -26,6 +26,17 @@
  *   run_gemma4.exe --model-dir gemma-4-E2B-it-ov --prompt-file prompt.txt
  */
 
+// Prevent windows.h min/max macros from breaking std::numeric_limits
+// Must be defined before ANY header that might pull in <windows.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#endif
+
 #include <chrono>
 #include <filesystem>
 #include <fstream>

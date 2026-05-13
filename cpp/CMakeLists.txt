@@ -7,9 +7,9 @@ project(run_gemma4_cpp LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Static CRT on MSVC (match openvino.genai build)
+# Dynamic CRT on MSVC (match openvino pip package)
 if(MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
 # ── Find OpenVINO GenAI ────────────────────────────────────────────────────

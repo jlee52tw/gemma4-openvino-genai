@@ -628,7 +628,14 @@ Phase 2 的 benchmark 測試結果（見 `20260508_dense_weight_streaming_plan.m
 
 ---
 
-## 9. 方案 A：真正的 Async IO（推薦 — 可在現有架構上修改）
+## 9. 方案 A：真正的 Async IO（推薦 — ✅ 已實作）
+
+> **Implementation Status (2026-05-14):** 已完成實作。
+> - `dense_weight_streaming_manager.hpp/cpp`: `FILE_FLAG_OVERLAPPED` + Event-based async `ReadFile`
+> - 移除 `std::thread` prefetch，改用 `start_async_load()` / `wait_async_load()` / `is_async_load_complete()`
+> - `network.cpp`: 更新 pipeline 註解，`prefetch_next_group()` 現在立即返回
+> - 系統：8533MHz 32GB LPDDR5，iGPU 27GB USM，>100 GB/s 記憶體頻寬
+> - NVMe DMA (~12 GB/s) + iGPU DMA (~50 GB/s) << LPDDR5 頻寬 → 無競爭
 
 ### 9.1 核心問題
 
@@ -667,15 +674,17 @@ WaitForSingleObject(ov.hEvent, INFINITE);
 CloseHandle(ov.hEvent);
 ```
 
-### 9.3 修改範圍
+### 9.3 實際修改內容（已完成）
 
-| 檔案 | 修改 |
-|---|---|
-| `dense_weight_streaming_manager.cpp` | `initialize_direct_io()`: 加 `FILE_FLAG_OVERLAPPED` |
-| `dense_weight_streaming_manager.cpp` | `load_direct_io()`: 改用 async `ReadFile` + Event |
-| `dense_weight_streaming_manager.cpp` | `prefetch_next_group()`: 不再 spawn `std::thread`，直接用 async `ReadFile` |
-| `dense_weight_streaming_manager.hpp` | 加 `HANDLE m_io_events[]` 成員 |
-| `network.cpp` | `execute_impl_streamed()`: 調整 fence 順序 |
+| 檔案 | 修改 | 狀態 |
+|---|---|:---:|
+| `dense_weight_streaming_manager.hpp` | 移除 `m_prefetch_thread`，加 `m_io_events[]`、`m_overlapped_storage`、`start_async_load()`、`wait_async_load()`、`is_async_load_complete()` | ✅ |
+| `dense_weight_streaming_manager.cpp` | `initialize_direct_io()`: `FILE_FLAG_OVERLAPPED` + 建立 Events | ✅ |
+| `dense_weight_streaming_manager.cpp` | 新增 `start_async_load()`: 多 handle async ReadFile | ✅ |
+| `dense_weight_streaming_manager.cpp` | 新增 `wait_async_load()`: `WaitForMultipleObjects` | ✅ |
+| `dense_weight_streaming_manager.cpp` | `prefetch_next_group()`: 不再 spawn `std::thread`，直接 `start_async_load()` | ✅ |
+| `dense_weight_streaming_manager.cpp` | 移除 `join_prefetch_thread()`，`shutdown_io()` 清理 Events | ✅ |
+| `network.cpp` | 更新 pipeline 註解（async ReadFile 模式） | ✅ |
 
 ### 9.4 改良後的 Pipeline 流程
 

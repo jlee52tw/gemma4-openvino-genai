@@ -8,16 +8,20 @@
 // double-buffer streaming for decoder layer weights, enabling inference
 // on memory-constrained systems.
 //
-// IO Method: Win32 ReadFile with FILE_FLAG_NO_BUFFERING (Direct I/O)
+// IO Method: Win32 Async ReadFile with FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED
 //   - Bypasses OS page cache → no memory pressure
 //   - Reads directly into USM host buffer (page-aligned → sector-aligned)
-//   - Multi-threaded OVERLAPPED reads for ~11.2 GB/s throughput
+//   - True async I/O: ReadFile returns immediately, NVMe DMA runs in background
+//   - Multiple overlapped reads across file handles for max NVMe queue depth
 //   - Zero-copy: NVMe DMA → LPDDR5 (USM) → iGPU kernel read
+//   - GPU compute and NVMe DMA run concurrently (both DMA, no CPU bottleneck)
+//   - LPDDR5 8533MHz bandwidth (>100 GB/s) >> NVMe (~12 GB/s) + iGPU (~50 GB/s)
 //
-// Why Direct I/O instead of DirectStorage?
-//   - Benchmark showed Direct I/O 11.2 GB/s > DS 8.5 GB/s for sequential IO
-//   - DS's BypassIO advantage only helps random small-IO (MoE), not sequential
-//   - Kernel read-ahead optimization gives Direct I/O the edge for large reads
+// Why Async ReadFile instead of multi-threaded sync ReadFile?
+//   - No thread creation/destruction overhead per group transition
+//   - Native kernel-level async → NVMe controller DMA without CPU involvement
+//   - GPU and IO truly independent: no thread synchronization latency
+//   - Event-based completion: WaitForMultipleObjects for zero-overhead fence
 //
 // Key differences from MoE OTD:
 //   - Sequential access pattern (no LRU/slot management needed)
@@ -28,16 +32,17 @@
 // Architecture:
 //   1. Model compiled ONCE (all weights loaded into USM initially)
 //   2. At runtime: free excess weight memory, allocate 2 streaming buffers
-//   3. Per-token decode loop:
-//      - Load group N weights from NVMe → Buffer[active] (Direct I/O)
-//      - Execute group N layers on GPU (reads from Buffer[active])
-//      - Simultaneously: Load group N+1 → Buffer[inactive] (prefetch)
-//      - Swap active/inactive buffers
+//   3. Per-token decode loop (async IO pipeline):
+//      - Issue async ReadFile for group N → Buffer[active] (non-blocking)
+//      - Wait for async IO completion
+//      - Swap weight pointers + set kernel arguments
+//      - Issue async ReadFile for group N+1 → Buffer[inactive] (non-blocking)
+//      - Execute group N on GPU (concurrent with N+1's NVMe DMA)
 //      - Repeat for all groups
 //
 // Data path (zero-copy on iGPU):
 //   NVMe SSD →(DMA)→ LPDDR5 (USM host buffer) →(GPU read)→ iGPU compute
-//              ReadFile(NO_BUFFERING)            same physical memory
+//              Async ReadFile(OVERLAPPED)         same physical memory
 //
 // Usage:
 //   DenseWeightStreamingManager manager(engine, config);
@@ -46,7 +51,7 @@
 //   // Per-token decode:
 //   for (int group = 0; group < manager.num_groups(); ++group) {
 //       manager.load_group(group);      // Direct I/O NVMe→USM
-//       manager.wait_for_load(group);   // Ensure IO threads complete
+//       manager.wait_for_load(group);   // Wait for async IO completion
 //       // Execute layers... (GPU reads from manager.get_weight_buffer(group))
 //       manager.prefetch_next_group(group + 1);  // Overlap with GPU
 //   }
@@ -231,7 +236,9 @@ struct DenseStreamingConfig {
     /// Number of layer groups (default: determined from file header)
     uint32_t num_groups = 0;
     
-    /// Number of IO threads for multi-threaded Direct I/O reads (1-8, default: 4)
+    /// Number of IO handles for concurrent async reads (1-8, default: 4)
+    /// Each handle issues its own async ReadFile for a portion of the data.
+    /// More handles = more NVMe queue depth = higher throughput.
     uint32_t num_io_threads = 4;
     
     /// Whether to lock USM buffers in physical memory (VirtualLock)
@@ -346,8 +353,8 @@ struct DenseStreamingStats {
 ///
 /// Provides double-buffered NVMe→USM streaming, allowing GPU inference on
 /// models larger than available memory by loading layer groups on-demand.
-/// Uses Win32 ReadFile with FILE_FLAG_NO_BUFFERING for zero-copy reads
-/// directly into USM host buffers at ~11.2 GB/s.
+/// Uses Win32 Async ReadFile with FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED
+/// for zero-copy reads directly into USM host buffers.
 class DenseWeightStreamingManager {
 public:
     /// @brief Construct manager (does not initialize — call initialize() next)
@@ -396,9 +403,9 @@ public:
     /// @param group_idx Group index (0 to num_groups-1)
     /// @return true if load initiated successfully
     ///
-    /// Uses multi-threaded Direct I/O (ReadFile + FILE_FLAG_NO_BUFFERING)
-    /// to read directly into USM host buffer. Non-blocking — spawns IO
-    /// threads that read in parallel.
+    /// Uses Async ReadFile (FILE_FLAG_OVERLAPPED) for non-blocking I/O.
+    /// Issues async reads and returns immediately. Call wait_for_load()
+    /// to wait for completion.
     bool load_group(uint32_t group_idx);
     
     /// @brief Wait for a group load to complete
@@ -411,9 +418,9 @@ public:
     /// @return true if prefetch initiated
     ///
     /// This is the key to the double-buffer pipeline:
-    /// While GPU computes current group, IO threads load the next group
-    /// into the OTHER buffer. No overlap conflict because they use different
-    /// memory regions.
+    /// Issues async ReadFile (non-blocking) for the next group into the
+    /// OTHER buffer. NVMe DMA runs concurrently with GPU compute.
+    /// No overlap conflict because they use different memory regions.
     bool prefetch_next_group(uint32_t next_group_idx);
     
     /// @brief Check if a prefetch has completed (non-blocking)
@@ -615,7 +622,7 @@ private:
     /// @brief Allocate double-buffer USM host memory
     bool allocate_buffers();
     
-    /// @brief Initialize Direct I/O file handle and IO thread resources
+    /// @brief Initialize Async I/O file handles and event resources
     bool initialize_direct_io();
     
     /// @brief Cleanup IO resources
@@ -625,18 +632,41 @@ private:
     // Private: I/O methods
     // ========================================================================
     
-    /// @brief Load via multi-threaded Direct I/O (ReadFile + NO_BUFFERING)
+    /// @brief Load via Async ReadFile (FILE_FLAG_OVERLAPPED)
     /// @param file_offset Absolute offset in dense_weights_streaming.bin
     /// @param size Bytes to read
     /// @param dest_ptr Destination USM host pointer (must be page-aligned)
     /// @param buffer_idx Buffer slot (0 or 1) for tracking
-    /// @return true if all IO threads completed successfully
+    /// @return true if all async IO operations completed successfully
     ///
+    /// Synchronous wrapper: issues async ReadFile calls then waits.
     /// Reads directly into dest_ptr with zero-copy. The destination pointer
     /// (USM host buffer) is page-aligned (4096 bytes), which satisfies
     /// FILE_FLAG_NO_BUFFERING's sector-alignment requirement.
     bool load_direct_io(uint64_t file_offset, uint64_t size,
                         void* dest_ptr, uint32_t buffer_idx);
+    
+    /// @brief Issue async ReadFile calls (non-blocking, returns immediately)
+    /// @param file_offset Absolute offset in file
+    /// @param size Bytes to read (must be sector-aligned)
+    /// @param dest_ptr Destination USM host pointer (must be page-aligned)
+    /// @return true if all async IO operations were submitted successfully
+    ///
+    /// Splits the read across num_io_handles file handles, each with its own
+    /// async ReadFile + OVERLAPPED + Event. Returns immediately — the NVMe
+    /// controller performs DMA in the background.
+    bool start_async_load(uint64_t file_offset, uint64_t size, void* dest_ptr);
+    
+    /// @brief Wait for all outstanding async ReadFile operations to complete
+    /// @return true if all operations completed successfully
+    ///
+    /// Uses WaitForMultipleObjects to efficiently wait for all async reads.
+    /// After return, the destination buffer contains the loaded data.
+    bool wait_async_load();
+    
+    /// @brief Check if async load has completed (non-blocking)
+    /// @return true if no async ops in flight or all have completed
+    bool is_async_load_complete() const;
 
     // ========================================================================
     // Private: Members
@@ -668,17 +698,23 @@ private:
     /// @brief Find a free (non-active) buffer for loading. Returns buffer index.
     int find_free_buffer(uint32_t exclude_group = UINT32_MAX) const;
     
-    // Direct I/O file handles (one per IO thread for concurrent reads)
-    // Opened with FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN
+    // Direct I/O file handles (one per IO handle for concurrent async reads)
+    // Opened with FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED
     std::vector<void*> m_io_handles;  // HANDLE[], size = num_io_threads
     size_t m_sector_size = SECTOR_SIZE;
     
-    // Async prefetch thread (runs load_direct_io in background)
-    std::thread m_prefetch_thread;
-    std::atomic<bool> m_prefetch_success{false};
-    
-    /// @brief Join prefetch thread if running
-    void join_prefetch_thread();
+    // Async I/O state (FILE_FLAG_OVERLAPPED based)
+    // Replaces std::thread prefetch with native kernel-level async I/O.
+    // Each file handle gets its own OVERLAPPED struct + manual-reset Event.
+    // NVMe DMA runs in background, GPU and IO are truly independent.
+    static constexpr uint32_t MAX_ASYNC_OPS = 32;
+    std::vector<void*> m_io_events;      // HANDLE[], manual-reset events
+    void* m_overlapped_storage = nullptr; // Array of OVERLAPPED structs (opaque)
+    uint32_t m_async_num_ops = 0;        // Number of async ReadFile ops in flight
+    int m_async_target_buffer = -1;      // Buffer slot being async-loaded into
+    uint32_t m_async_target_group = UINT32_MAX;  // Group being async-loaded
+    std::atomic<bool> m_async_in_progress{false};
+    std::chrono::high_resolution_clock::time_point m_async_start_time;
     
     // Statistics
     DenseStreamingStats m_stats;
@@ -734,7 +770,6 @@ private:
     
     // Synchronization
     std::mutex m_load_mutex;  // Protects load operations
-    std::atomic<bool> m_prefetch_in_progress{false};
     uint32_t m_prefetch_group_idx = UINT32_MAX;
 };
 

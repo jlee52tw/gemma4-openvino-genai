@@ -282,6 +282,11 @@ struct DenseStreamingConfig {
     /// Total decoder layers in the model (default: 42 for Gemma4)
     uint32_t total_decoder_layers = 42;
     
+    /// Disable IO/GPU overlap (prefetch). When true, each group is loaded
+    /// synchronously before GPU compute — no pipelining. Set via
+    /// OV_DENSE_STREAM_NO_PREFETCH=1. Useful for v1-vs-v2 comparison.
+    bool no_prefetch = false;
+    
     /// @brief First streamed layer index: pin_head_layers
     uint32_t first_streamed_layer() const { return pin_head_layers; }
     
@@ -594,6 +599,12 @@ public:
     uint32_t pin_tail_layers() const { return m_config.pin_tail_layers; }
     uint32_t num_streamed_layers() const { return m_config.num_streamed_layers(); }
     bool is_layer_pinned(uint32_t layer_idx) const { return m_config.is_pinned(layer_idx); }
+    
+    /// @brief Check if debug logging is enabled (for network.cpp per-group logging)
+    bool debug_enabled() const { return m_config.debug_logging; }
+    
+    /// @brief Check if prefetch (IO/GPU overlap) is disabled (v1 sequential mode)
+    bool is_prefetch_disabled() const { return m_config.no_prefetch; }
 
     // ========================================================================
     // Statistics & Debug

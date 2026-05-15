@@ -80,6 +80,8 @@ void DenseStreamingConfig::read_from_env() {
     }
     if (const char* v = std::getenv("OV_DENSE_STREAM_NUM_BUFFERS"))
         num_buffers = std::clamp(static_cast<uint32_t>(std::stoul(v)), 2u, 4u);
+    if (const char* v = std::getenv("OV_DENSE_STREAM_NO_PREFETCH"))
+        no_prefetch = (std::string(v) == "1");
     // Hybrid pinning: number of head/tail layers to keep permanently in memory
     if (const char* v = std::getenv("OV_DENSE_STREAM_PIN_HEAD"))
         pin_head_layers = std::clamp(static_cast<uint32_t>(std::stoul(v)), 0u, total_decoder_layers);
@@ -87,6 +89,15 @@ void DenseStreamingConfig::read_from_env() {
         pin_tail_layers = std::clamp(static_cast<uint32_t>(std::stoul(v)), 0u, total_decoder_layers);
     if (const char* v = std::getenv("OV_DENSE_STREAM_TOTAL_LAYERS"))
         total_decoder_layers = static_cast<uint32_t>(std::stoul(v));
+
+    // Auto-generate log file path when debug is enabled but no explicit log path.
+    // This avoids flooding stderr (console writes are slow and impact performance).
+    if (debug_logging && debug_log_path.empty() && !weights_file_path.empty()) {
+        // Place log file next to the weights file
+        auto pos = weights_file_path.find_last_of("\\/");
+        std::string dir = (pos != std::string::npos) ? weights_file_path.substr(0, pos + 1) : "";
+        debug_log_path = dir + "dense_streaming_debug.log";
+    }
 }
 
 // ============================================================================
@@ -202,13 +213,31 @@ DenseWeightStreamingManager::DenseWeightStreamingManager(cldnn::engine& engine,
                                                            const DenseStreamingConfig& config)
     : m_engine(engine)
     , m_config(config) {
-    // Open debug log file if specified
+    // Auto-generate log file path when debug is enabled but no path specified.
+    // This avoids 2000+ fprintf(stderr) per 256-token generation which causes
+    // severe performance degradation due to console I/O overhead.
+    if (m_config.debug_logging && m_config.debug_log_path.empty()) {
+        // Place log next to weights file, or in current dir as fallback
+        std::string base_dir;
+        if (!m_config.weights_file_path.empty()) {
+            auto sep = m_config.weights_file_path.find_last_of("\\/");
+            if (sep != std::string::npos)
+                base_dir = m_config.weights_file_path.substr(0, sep + 1);
+        }
+        m_config.debug_log_path = base_dir + "dense_streaming_debug.log";
+    }
+
+    // Open debug log file if specified (or auto-generated above)
     if (!m_config.debug_log_path.empty()) {
         m_debug_log = fopen(m_config.debug_log_path.c_str(), "w");
         if (m_debug_log) {
             fprintf(m_debug_log, "=== Dense Weight Streaming Debug Log ===\n");
             fprintf(m_debug_log, "Timestamp: %s\n", __TIMESTAMP__);
+            fprintf(m_debug_log, "Log file: %s\n", m_config.debug_log_path.c_str());
             fflush(m_debug_log);
+            // Brief note to stderr so user knows where logs went
+            fprintf(stderr, "[DenseStreaming] Debug log → %s\n",
+                    m_config.debug_log_path.c_str());
         } else {
             std::cerr << "[DenseStreaming] WARNING: Cannot open log file: "
                       << m_config.debug_log_path << ", using stderr\n";
@@ -627,8 +656,7 @@ bool DenseWeightStreamingManager::load_group(uint32_t group_idx) {
     for (int i = 0; i < m_num_buffers; ++i) {
         if (m_buffer_group[i] == static_cast<int32_t>(group_idx)) {
             if (m_config.debug_logging) {
-                std::cout << "[DenseStreaming] load_group(" << group_idx 
-                          << ") — already in buffer[" << i << "], skipping IO\n";
+                fprintf(debug_log_file(), "[DenseStreaming] load_group(%u) — already in buffer[%d], skipping IO\n", group_idx, i);
             }
             return true;  // Already loaded, wait_for_load will just swap
         }
@@ -641,10 +669,9 @@ bool DenseWeightStreamingManager::load_group(uint32_t group_idx) {
     void* dest = m_buffer_ptrs[load_buffer];
     
     if (m_config.debug_logging) {
-        std::cout << "[DenseStreaming] load_group(" << group_idx 
-                  << ") → buffer[" << load_buffer << "]"
-                  << "  offset=" << group.file_offset 
-                  << "  size=" << (group.aligned_bytes / (1024.0*1024.0)) << " MB\n";
+        fprintf(debug_log_file(), "[DenseStreaming] load_group(%u) → buffer[%d]  offset=%llu  size=%.2f MB\n",
+                group_idx, load_buffer, (unsigned long long)group.file_offset,
+                group.aligned_bytes / (1024.0*1024.0));
     }
     
     // Synchronous async I/O: issue + wait (for cold start / forced sync load)
@@ -679,9 +706,8 @@ bool DenseWeightStreamingManager::load_group(uint32_t group_idx) {
             }
             
             if (m_config.debug_logging) {
-                std::cout << "[DenseStreaming] load_group(" << group_idx 
-                          << ") completed: " << elapsed_ms << " ms, "
-                          << throughput_gbps << " GB/s\n";
+                fprintf(debug_log_file(), "[DenseStreaming] load_group(%u) completed: %.2f ms, %.2f GB/s\n",
+                        group_idx, elapsed_ms, throughput_gbps);
             }
         }
     }
@@ -734,8 +760,8 @@ bool DenseWeightStreamingManager::prefetch_next_group(uint32_t next_group_idx) {
     for (int i = 0; i < m_num_buffers; ++i) {
         if (m_buffer_group[i] == static_cast<int32_t>(next_group_idx)) {
             if (m_config.debug_logging) {
-                std::cout << "[DenseStreaming] prefetch_next_group(" << next_group_idx
-                          << ") — already in buffer[" << i << "], skipping\n";
+                fprintf(debug_log_file(), "[DenseStreaming] prefetch_next_group(%u) — already in buffer[%d], skipping\n",
+                        next_group_idx, i);
             }
             return true;
         }
@@ -753,8 +779,8 @@ bool DenseWeightStreamingManager::prefetch_next_group(uint32_t next_group_idx) {
     void* dest = m_buffer_ptrs[prefetch_buffer];
     
     if (m_config.debug_logging) {
-        std::cout << "[DenseStreaming] prefetch_next_group(" << next_group_idx
-                  << ") → buffer[" << prefetch_buffer << "] (async IO)\n";
+        fprintf(debug_log_file(), "[DenseStreaming] prefetch_next_group(%u) → buffer[%d] (async IO)\n",
+                next_group_idx, prefetch_buffer);
     }
     
     // Issue async ReadFile calls — returns IMMEDIATELY.
@@ -1471,8 +1497,8 @@ bool DenseWeightStreamingManager::swap_weight_pointers(uint32_t group_idx, void*
         auto data_inst = net->get_primitive(mapping.primitive_id);
         if (!data_inst) {
             if (m_config.debug_logging) {
-                std::cerr << "[DenseStreaming] WARNING: primitive '" 
-                          << mapping.primitive_id << "' not found\n";
+                fprintf(debug_log_file(), "[DenseStreaming] WARNING: primitive '%s' not found\n",
+                        mapping.primitive_id.c_str());
             }
             continue;
         }
@@ -1503,10 +1529,21 @@ bool DenseWeightStreamingManager::swap_weight_pointers(uint32_t group_idx, void*
             if (fc_inst) {
                 auto weights_layout_opt = fc_inst->get_impl_params()->weights_layout;
                 if (weights_layout_opt.has_value()) {
+                    auto expected_bytes = weights_layout_opt.value().bytes_count();
+                    auto subbuf_bytes = new_mem->size();
+                    if (expected_bytes != subbuf_bytes && m_config.debug_logging) {
+                        fprintf(debug_log_file(), "[DenseStreaming] WARNING: cache key size=%zu != subbuf size=%zu"
+                                " for FC '%s' tensor '%s' alloc_type=%d\n",
+                                expected_bytes, subbuf_bytes,
+                                mapping.fc_primitive_id.c_str(), mapping.tensor_name.c_str(),
+                                static_cast<int>(new_mem->get_allocation_type()));
+                    }
                     fc_inst->update_weights_cache(weights_layout_opt.value(), new_mem);
                 } else {
-                    // weights_layout not set yet — just rely on dep[1] replacement
-                    // update_weights() will pick up the new dep[1] on next call
+                    if (m_config.debug_logging) {
+                        fprintf(debug_log_file(), "[DenseStreaming] INFO: weights_layout not set for FC '%s' — relying on dep[1]\n",
+                                mapping.fc_primitive_id.c_str());
+                    }
                 }
             }
             ++swapped;
@@ -1526,10 +1563,9 @@ bool DenseWeightStreamingManager::swap_weight_pointers(uint32_t group_idx, void*
     // prevents re-entry after the initial call unless explicitly reset.
     
     if (m_config.debug_logging) {
-        std::cout << "[DenseStreaming] swap_weight_pointers(group=" << group_idx 
-                  << "): swapped " << swapped << " tensors, "
-                  << "layers " << group.first_layer << "-" 
-                  << (group.first_layer + group.num_layers - 1) << "\n";
+        fprintf(debug_log_file(), "[DenseStreaming] swap_weight_pointers(group=%u): swapped %u tensors, layers %u-%u\n",
+                group_idx, swapped, group.first_layer,
+                group.first_layer + group.num_layers - 1);
     }
     
     return swapped > 0;
@@ -1747,7 +1783,7 @@ bool DenseWeightStreamingManager::execute_streamed_decode(
         }
         
         // Start prefetch for group 1 BEFORE GPU compute of group 0
-        if (ng > 1) {
+        if (ng > 1 && !m_config.no_prefetch) {
             prefetch_next_group(1);
         }
         
@@ -1778,9 +1814,16 @@ bool DenseWeightStreamingManager::execute_streamed_decode(
                     std::chrono::duration<double, std::milli>(fence_t1 - fence_t0).count();
             }
             
-            // IO Fence: wait for this group's prefetch
+            // IO Fence: wait for this group's prefetch (or cold load in no_prefetch mode)
             {
                 auto io_t0 = std::chrono::high_resolution_clock::now();
+                // In no_prefetch mode, group was NOT prefetched — do sync load now
+                if (m_config.no_prefetch) {
+                    if (!load_group(g)) {
+                        std::cerr << "[DenseStreaming] Failed to load group " << g << "\n";
+                        return false;
+                    }
+                }
                 if (!wait_for_load(g)) {
                     std::cerr << "[DenseStreaming] Failed to wait for group " << g << "\n";
                     return false;
@@ -1799,8 +1842,8 @@ bool DenseWeightStreamingManager::execute_streamed_decode(
                     std::chrono::duration<double, std::milli>(swap_t1 - swap_t0).count();
             }
             
-            // Prefetch next group
-            if (g + 1 < ng) {
+            // Prefetch next group (skip in no_prefetch mode for sequential IO→GPU)
+            if (g + 1 < ng && !m_config.no_prefetch) {
                 prefetch_next_group(g + 1);
             }
             
@@ -2161,9 +2204,8 @@ bool DenseWeightStreamingManager::start_async_load(uint64_t file_offset,
     m_async_in_progress.store(true);
     
     if (m_config.debug_logging) {
-        std::cout << "[DenseStreaming] start_async_load: " << op_idx
-                  << " async ReadFile ops issued across " << num_handles
-                  << " handles, " << (size / (1024.0*1024.0)) << " MB total\n";
+        fprintf(debug_log_file(), "[DenseStreaming] start_async_load: %u async ReadFile ops issued across %u handles, %.3f MB total\n",
+                op_idx, num_handles, size / (1024.0*1024.0));
     }
     
     return true;
@@ -2261,9 +2303,8 @@ bool DenseWeightStreamingManager::wait_async_load() {
         }
         
         if (m_config.debug_logging) {
-            std::cout << "[DenseStreaming] wait_async_load: group "
-                      << m_async_target_group << " loaded in "
-                      << elapsed_ms << " ms (" << m_async_num_ops << " ops)\n";
+            fprintf(debug_log_file(), "[DenseStreaming] wait_async_load: group %u loaded in %.4f ms (%u ops)\n",
+                    m_async_target_group, elapsed_ms, m_async_num_ops);
         }
     }
     

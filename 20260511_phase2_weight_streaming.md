@@ -1,7 +1,33 @@
 # Dense Weight Streaming — Phase 2 Implementation Progress
-**Date:** 2026-05-11 (final)  
+**Date:** 2026-05-19 (updated)  
 **Author:** jlee52tw  
-**Status:** Phase 2 FC weight streaming — ✅ 完成，4-layer/3-buffer 最佳配置確認
+**Status:** Phase 2 FC weight streaming — ✅ 完成，4-layer/3-buffer + Dual-NVMe 確認
+
+---
+
+## 0. 最新進度摘要（2026-05-19）
+
+### Dual-NVMe Parallel IO 已實作並驗證
+
+| 模式 | Avg TPOT | tok/s | Load% | GPU% |
+|------|----------|-------|-------|------|
+| v1 Sequential (baseline) | 177.48 ms | 5.63 | — | — |
+| v2 Pipeline (single NVMe) | 142.81 ms | 7.00 | 56.0% | 42.7% |
+| **v2 Dual-path (same disk)** | **128.56 ms** | **7.78** | **48.2%** | **50.6%** |
+| v2 Dual NVMe (estimated) | ~77 ms | ~13.0 | — | — |
+
+### 架構：Group-Half Striping
+- 每個 group (~200 MB) 在 sector-aligned 中點切半
+- 兩半分別存入 `streaming_0.bin` (NVMe 0) 和 `streaming_1.bin` (NVMe 1)
+- Runtime 平行讀取兩個檔案，寫入同一個 USM buffer（連續區域）
+- 4 個 async handles，每個 NVMe 分配 2 個
+
+### 使用方式
+```powershell
+$env:OV_DENSE_STREAM_WEIGHTS = "C:\path\to\dense_weights_streaming_0.bin"
+$env:OV_DENSE_STREAM_WEIGHTS_2 = "D:\path\to\dense_weights_streaming_1.bin"
+python run_gemma4.py --model-dir <model_dir> --prompt "..."
+```
 
 ---
 

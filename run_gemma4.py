@@ -174,10 +174,30 @@ def main():
 
     t0 = time.perf_counter()
 
+    # Build kwargs for VLMPipeline
+    pipeline_kwargs = {}
     if args.no_mmap:
-        pipe = ov_genai.VLMPipeline(str(model_dir), args.device, ENABLE_MMAP='NO')
+        pipeline_kwargs['ENABLE_MMAP'] = 'NO'
+
+    # Auto-detect model_cache directory for compiled GPU kernel caching
+    cache_dir = model_dir / 'model_cache'
+    if cache_dir.exists():
+        pipeline_kwargs['CACHE_DIR'] = str(cache_dir)
+        print(f"  Using model cache: {cache_dir}")
     else:
-        pipe = ov_genai.VLMPipeline(str(model_dir), args.device)
+        # Create model_cache for first-run compilation caching
+        cache_dir.mkdir(exist_ok=True)
+        pipeline_kwargs['CACHE_DIR'] = str(cache_dir)
+        print(f"  Model cache dir created: {cache_dir} (first run will compile GPU kernels ~12s)")
+
+    # Per-layer embedding offload is automatic:
+    # If openvino_text_embeddings_per_layer_model_revised.bin exists in model_dir,
+    # VLMPipeline uses mmap to offload 3 GB embeddings (saves ~2.82 GB GPU memory).
+    revised_bin = model_dir / 'openvino_text_embeddings_per_layer_model_revised.bin'
+    if revised_bin.exists():
+        print(f"  Per-layer embedding offload: enabled (mmap, {revised_bin.stat().st_size / (1024**3):.2f} GB)")
+
+    pipe = ov_genai.VLMPipeline(str(model_dir), args.device, **pipeline_kwargs)
 
     load_time = time.perf_counter() - t0
     print(f"Model loaded in {load_time:.1f}s")

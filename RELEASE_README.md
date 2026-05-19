@@ -62,6 +62,31 @@ release/
 
 ---
 
+## File Size Explanation
+
+You might notice different large binary files — they serve completely different purposes:
+
+| File | Size | Purpose |
+|------|------|---------|
+| `openvino_language_model.bin` | 2.69 GB | Full decoder model (all 42 layers, all weights+scale+zp) |
+| `openvino_text_embeddings_per_layer_model_revised.bin` | 3.07 GB | Per-layer embedding lookup table (vocab=262144). Used via mmap — only ~10 KB read per token. Saves ~2.82 GB GPU memory. |
+| `dense_weights_streaming_0.bin` | 776 MB | **First half** of 32 streamed decoder layers' FC weights only |
+| `dense_weights_streaming_1.bin` | 776 MB | **Second half** of same 32 layers' FC weights |
+
+**Why streaming files are smaller than the language model:**
+- Streaming only includes FC weight tensors (not scale/zp/small constants)
+- Only 32 layers are streamed (layers 5-36); head/tail layers stay pinned in GPU memory
+- Scale and zero-point tensors (~5 MB/layer) remain in GPU memory (they get reordered by GPU compiler)
+- Total: 776 MB × 2 = 1.55 GB out of 2.69 GB
+
+**Per-layer embedding offload (automatic):**
+- When `openvino_text_embeddings_per_layer_model_revised.bin` exists in the model directory, VLMPipeline automatically uses memory-mapped (mmap) access
+- Each token only reads ~10 KB from the 3 GB file (embedding lookup)
+- This saves ~2.82 GB of GPU/system memory — critical for 8 GB systems
+- No configuration needed — just keep the file in the model directory
+
+---
+
 ## Installation Steps
 
 ### 1. Install Python 3.12 and dependencies
@@ -114,6 +139,11 @@ Copy-Item "streaming_nvme1\dense_weights_streaming_1.bin" "D:\gemma4_streaming\"
 
 ## Running Inference
 
+> **Note:** `run_gemma4.py` automatically handles:
+> - `CACHE_DIR` — auto-detects `model/model_cache/` for compiled kernel caching
+> - Per-layer embedding offload — auto-detects `_revised.bin` and uses mmap
+> - No extra flags needed for these features.
+
 ### Single NVMe Mode
 
 ```powershell
@@ -150,6 +180,26 @@ Tested on Intel Panther Lake (12 Xe EUs, 16 GB LPDDR5):
 | v2 Pipeline (single NVMe) | 143 ms | 7.0 | ~12 GB/s NVMe bandwidth |
 | **v2 Dual-path (same disk)** | **129 ms** | **7.8** | Extra parallelism on single NVMe |
 | **v2 Dual NVMe (2 drives)** | **~77 ms** | **~13** | ~24 GB/s combined bandwidth |
+
+---
+
+## Correctness Verification
+
+Tested on 2026-05-19 with dual-path (same disk) — all answers correct:
+
+```
+Test1: "What is the capital of Japan?" → Tokyo ✅
+Test2: "What is 7 * 8?"               → 56 ✅
+Test3: "Translate to French: Hello"    → Bonjour, comment allez-vous? ✅
+```
+
+To run your own verification:
+```powershell
+$env:OV_DENSE_STREAM_WEIGHTS = "C:\model_dir\dense_weights_streaming_0.bin"
+$env:OV_DENSE_STREAM_WEIGHTS_2 = "D:\streaming\dense_weights_streaming_1.bin"
+python run_gemma4.py --model-dir "C:\model_dir" --prompt "What is the capital of Japan?" --max-new-tokens 10
+# Expected: "Tokyo"
+```
 
 ---
 

@@ -82,6 +82,9 @@ void DenseStreamingConfig::read_from_env() {
         num_buffers = std::clamp(static_cast<uint32_t>(std::stoul(v)), 2u, 4u);
     if (const char* v = std::getenv("OV_DENSE_STREAM_NO_PREFETCH"))
         no_prefetch = (std::string(v) == "1");
+    // Dual-NVMe: second stripe file path
+    if (const char* v = std::getenv("OV_DENSE_STREAM_WEIGHTS_2"))
+        weights_file_path_2 = v;
     // Hybrid pinning: number of head/tail layers to keep permanently in memory
     if (const char* v = std::getenv("OV_DENSE_STREAM_PIN_HEAD"))
         pin_head_layers = std::clamp(static_cast<uint32_t>(std::stoul(v)), 0u, total_decoder_layers);
@@ -308,6 +311,29 @@ bool DenseWeightStreamingManager::initialize() {
         return false;
     }
     
+    // Step 2b: Dual-NVMe — read group table from second stripe file
+    if (m_config.is_dual_nvme()) {
+        if (!read_tables_file2()) {
+            std::cerr << "[DenseStreaming] ERROR: Failed to read file 1 tables.\n";
+            return false;
+        }
+        // Compute full group sizes (sum of both stripes) for buffer allocation
+        m_full_group_aligned_bytes.resize(m_header.num_groups);
+        for (uint32_t g = 0; g < m_header.num_groups; ++g) {
+            m_full_group_aligned_bytes[g] = m_group_table[g].aligned_bytes
+                                          + m_group_table_2[g].aligned_bytes;
+        }
+        if (m_config.debug_logging) {
+            std::cout << "[DenseStreaming] Dual-NVMe: loaded group tables from both files\n";
+            for (uint32_t g = 0; g < m_header.num_groups; ++g) {
+                std::cout << "  Group " << g << ": stripe0=" 
+                          << (m_group_table[g].aligned_bytes / (1024.0*1024.0)) << " MB + stripe1="
+                          << (m_group_table_2[g].aligned_bytes / (1024.0*1024.0)) << " MB = "
+                          << (m_full_group_aligned_bytes[g] / (1024.0*1024.0)) << " MB\n";
+            }
+        }
+    }
+    
     // Step 3: Allocate double-buffer USM memory
     if (!allocate_buffers()) {
         std::cerr << "[DenseStreaming] ERROR: Failed to allocate buffers.\n";
@@ -337,7 +363,8 @@ bool DenseWeightStreamingManager::initialize() {
                   << "  Sector size: " << m_sector_size << "\n"
                   << "  Hybrid pinning: H" << m_config.pin_head_layers
                   << "+T" << m_config.pin_tail_layers << " (stream "
-                  << m_config.num_streamed_layers() << " middle layers)\n";
+                  << m_config.num_streamed_layers() << " middle layers)\n"
+                  << "  NVMe mode: " << (m_config.is_dual_nvme() ? "Dual (2x bandwidth)" : "Single") << "\n";
     }
     
     return true;
@@ -363,10 +390,10 @@ bool DenseWeightStreamingManager::read_file_header() {
         return false;
     }
     
-    // Validate version
-    if (m_header.version != DNSW_VERSION) {
+    // Validate version (accept V1 single-file and V2 dual-NVMe)
+    if (m_header.version == 0 || m_header.version > DNSW_VERSION) {
         std::cerr << "[DenseStreaming] Unsupported version: " << m_header.version 
-                  << " (expected " << DNSW_VERSION << ")\n";
+                  << " (expected 1 or " << DNSW_VERSION << ")\n";
         return false;
     }
     
@@ -422,11 +449,47 @@ bool DenseWeightStreamingManager::read_tables() {
     return true;
 }
 
+bool DenseWeightStreamingManager::read_tables_file2() {
+    std::ifstream file(m_config.weights_file_path_2, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "[DenseStreaming] Cannot open file 1: " << m_config.weights_file_path_2 << "\n";
+        return false;
+    }
+    
+    // Skip header, seek to group table
+    file.seekg(SECTOR_SIZE);
+    
+    // Read group table entries (same count as file 0)
+    m_group_table_2.resize(m_header.num_groups);
+    for (uint32_t i = 0; i < m_header.num_groups; ++i) {
+        file.read(reinterpret_cast<char*>(&m_group_table_2[i]), sizeof(GroupTableEntry));
+        if (!file) {
+            std::cerr << "[DenseStreaming] Failed reading file 1 group table entry " << i << "\n";
+            return false;
+        }
+    }
+    
+    if (m_config.debug_logging) {
+        std::cout << "[DenseStreaming] File 1 group table loaded (" << m_group_table_2.size() << " entries)\n";
+    }
+    
+    return true;
+}
+
 bool DenseWeightStreamingManager::allocate_buffers() {
     // Find the largest group (determines buffer size)
+    // In dual-NVMe mode, buffer must hold FULL group (sum of both stripes)
     uint64_t max_group_bytes = 0;
-    for (const auto& g : m_group_table) {
-        max_group_bytes = std::max(max_group_bytes, g.aligned_bytes);
+    if (!m_full_group_aligned_bytes.empty()) {
+        // Dual-NVMe: use pre-computed full sizes
+        for (auto sz : m_full_group_aligned_bytes) {
+            max_group_bytes = std::max(max_group_bytes, sz);
+        }
+    } else {
+        // Single-NVMe: use group table directly
+        for (const auto& g : m_group_table) {
+            max_group_bytes = std::max(max_group_bytes, g.aligned_bytes);
+        }
     }
     
     if (max_group_bytes == 0) {
@@ -523,9 +586,16 @@ bool DenseWeightStreamingManager::initialize_direct_io() {
     //   NVMe controller performs DMA in background, Event signals completion)
     // This replaces the previous multi-threaded sync ReadFile approach.
     uint32_t num_handles = m_config.num_io_threads;
-    m_io_handles.resize(num_handles, nullptr);
     
-    for (uint32_t i = 0; i < num_handles; ++i) {
+    // In dual-NVMe mode: split handles evenly between two files.
+    // Each NVMe gets num_handles/2 handles for its queue depth.
+    uint32_t handles_per_file = m_config.is_dual_nvme()
+        ? std::max(1u, num_handles / 2)
+        : num_handles;
+    
+    m_io_handles.resize(handles_per_file, nullptr);
+    
+    for (uint32_t i = 0; i < handles_per_file; ++i) {
         HANDLE hFile = CreateFileW(
             wide_path.c_str(),
             GENERIC_READ,
@@ -537,11 +607,44 @@ bool DenseWeightStreamingManager::initialize_direct_io() {
         
         if (hFile == INVALID_HANDLE_VALUE) {
             std::cerr << "[DenseStreaming] ERROR: Cannot open file handle #" << i
-                      << " for Async I/O. Error: " << GetLastError() << "\n";
+                      << " for Async I/O (file 0). Error: " << GetLastError() << "\n";
             shutdown_io();
             return false;
         }
         m_io_handles[i] = hFile;
+    }
+    
+    // Dual-NVMe: open handles for the second file
+    if (m_config.is_dual_nvme()) {
+        std::wstring wide_path_2(m_config.weights_file_path_2.begin(),
+                                 m_config.weights_file_path_2.end());
+        m_io_handles_2.resize(handles_per_file, nullptr);
+        
+        for (uint32_t i = 0; i < handles_per_file; ++i) {
+            HANDLE hFile = CreateFileW(
+                wide_path_2.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED,
+                nullptr);
+            
+            if (hFile == INVALID_HANDLE_VALUE) {
+                std::cerr << "[DenseStreaming] ERROR: Cannot open file handle #" << i
+                          << " for Async I/O (file 1). Error: " << GetLastError() << "\n";
+                shutdown_io();
+                return false;
+            }
+            m_io_handles_2[i] = hFile;
+        }
+        
+        if (m_config.debug_logging) {
+            std::cout << "[DenseStreaming] Dual-NVMe mode: " << handles_per_file
+                      << " handles per NVMe\n";
+            std::cout << "[DenseStreaming]   File 0: " << m_config.weights_file_path << "\n";
+            std::cout << "[DenseStreaming]   File 1: " << m_config.weights_file_path_2 << "\n";
+        }
     }
     
     // Create manual-reset events for async I/O completion notification.
@@ -592,6 +695,14 @@ void DenseWeightStreamingManager::shutdown_io() {
         }
     }
     m_io_handles.clear();
+    
+    // Close file 1 handles (dual-NVMe)
+    for (auto& handle : m_io_handles_2) {
+        if (handle && handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(static_cast<HANDLE>(handle));
+        }
+    }
+    m_io_handles_2.clear();
     
     // Close event handles
     for (auto& evt : m_io_events) {
@@ -669,16 +780,25 @@ bool DenseWeightStreamingManager::load_group(uint32_t group_idx) {
     void* dest = m_buffer_ptrs[load_buffer];
     
     if (m_config.debug_logging) {
-        fprintf(debug_log_file(), "[DenseStreaming] load_group(%u) → buffer[%d]  offset=%llu  size=%.2f MB\n",
+        uint64_t total_size = (!m_full_group_aligned_bytes.empty() && group_idx < m_full_group_aligned_bytes.size())
+            ? m_full_group_aligned_bytes[group_idx] : group.aligned_bytes;
+        fprintf(debug_log_file(), "[DenseStreaming] load_group(%u) → buffer[%d]  offset=%llu  size=%.2f MB%s\n",
                 group_idx, load_buffer, (unsigned long long)group.file_offset,
-                group.aligned_bytes / (1024.0*1024.0));
+                total_size / (1024.0*1024.0),
+                m_config.is_dual_nvme() ? " (dual-NVMe)" : "");
     }
     
     // Synchronous async I/O: issue + wait (for cold start / forced sync load)
     auto t0 = std::chrono::high_resolution_clock::now();
     m_async_target_buffer = load_buffer;
     m_async_target_group = group_idx;
-    bool success = start_async_load(group.file_offset, group.aligned_bytes, dest);
+    
+    bool success;
+    if (m_config.is_dual_nvme() && !m_group_table_2.empty()) {
+        success = start_async_load_dual(group_idx, dest);
+    } else {
+        success = start_async_load(group.file_offset, group.aligned_bytes, dest);
+    }
     if (success) {
         success = wait_async_load();
     }
@@ -690,15 +810,19 @@ bool DenseWeightStreamingManager::load_group(uint32_t group_idx) {
         // Record timing
         if (m_config.enable_timing) {
             double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            // In dual-NVMe mode, actual bytes loaded = sum of both stripes
+            uint64_t loaded_bytes = (!m_full_group_aligned_bytes.empty() && group_idx < m_full_group_aligned_bytes.size())
+                ? m_full_group_aligned_bytes[group_idx]
+                : group.aligned_bytes;
             m_stats.total_loads.fetch_add(1);
-            m_stats.total_bytes_loaded.fetch_add(group.aligned_bytes);
+            m_stats.total_bytes_loaded.fetch_add(loaded_bytes);
             atomic_add_double(m_stats.total_load_time_ms, elapsed_ms);
             
             if (group_idx < m_stats.group_load_time_ms.size()) {
                 m_stats.group_load_time_ms[group_idx] = elapsed_ms;
             }
             
-            double throughput_gbps = (group.aligned_bytes / (1024.0*1024.0*1024.0)) 
+            double throughput_gbps = (loaded_bytes / (1024.0*1024.0*1024.0)) 
                                    / (elapsed_ms / 1000.0);
             double current_peak = m_stats.peak_throughput_gbps.load();
             while (throughput_gbps > current_peak) {
@@ -706,8 +830,9 @@ bool DenseWeightStreamingManager::load_group(uint32_t group_idx) {
             }
             
             if (m_config.debug_logging) {
-                fprintf(debug_log_file(), "[DenseStreaming] load_group(%u) completed: %.2f ms, %.2f GB/s\n",
-                        group_idx, elapsed_ms, throughput_gbps);
+                fprintf(debug_log_file(), "[DenseStreaming] load_group(%u) completed: %.2f ms, %.2f GB/s%s\n",
+                        group_idx, elapsed_ms, throughput_gbps,
+                        m_config.is_dual_nvme() ? " (dual-NVMe)" : "");
             }
         }
     }
@@ -790,7 +915,12 @@ bool DenseWeightStreamingManager::prefetch_next_group(uint32_t next_group_idx) {
     m_async_target_group = next_group_idx;
     m_async_start_time = std::chrono::high_resolution_clock::now();
     
-    bool ok = start_async_load(group.file_offset, group.aligned_bytes, dest);
+    bool ok;
+    if (m_config.is_dual_nvme() && !m_group_table_2.empty()) {
+        ok = start_async_load_dual(next_group_idx, dest);
+    } else {
+        ok = start_async_load(group.file_offset, group.aligned_bytes, dest);
+    }
     if (!ok) {
         std::cerr << "[DenseStreaming] prefetch: start_async_load failed!\n";
         m_async_in_progress.store(false);
@@ -2206,6 +2336,122 @@ bool DenseWeightStreamingManager::start_async_load(uint64_t file_offset,
     if (m_config.debug_logging) {
         fprintf(debug_log_file(), "[DenseStreaming] start_async_load: %u async ReadFile ops issued across %u handles, %.3f MB total\n",
                 op_idx, num_handles, size / (1024.0*1024.0));
+    }
+    
+    return true;
+
+#else
+    return false;
+#endif
+}
+
+// ============================================================================
+// Dual-NVMe Async Load: reads from 2 stripe files in parallel
+// ============================================================================
+
+bool DenseWeightStreamingManager::start_async_load_dual(uint32_t group_idx,
+                                                         void* dest_ptr) {
+#ifdef _WIN32
+    if (group_idx >= m_group_table.size() || group_idx >= m_group_table_2.size()) {
+        std::cerr << "[DenseStreaming] start_async_load_dual: invalid group " << group_idx << "\n";
+        return false;
+    }
+    
+    const auto& gt0 = m_group_table[group_idx];   // stripe 0 info
+    const auto& gt1 = m_group_table_2[group_idx]; // stripe 1 info
+    
+    uint32_t num_handles_0 = static_cast<uint32_t>(m_io_handles.size());
+    uint32_t num_handles_1 = static_cast<uint32_t>(m_io_handles_2.size());
+    
+    if (num_handles_0 == 0 || num_handles_1 == 0) {
+        std::cerr << "[DenseStreaming] start_async_load_dual: no handles available\n";
+        return false;
+    }
+    
+    uint64_t size_0 = gt0.aligned_bytes;  // bytes to read from file 0
+    uint64_t size_1 = gt1.aligned_bytes;  // bytes to read from file 1
+    
+    OVERLAPPED* overlapped_arr = static_cast<OVERLAPPED*>(m_overlapped_storage);
+    uint32_t op_idx = 0;
+    
+    // Lambda: issue async reads for one file
+    auto issue_reads = [&](std::vector<void*>& handles, uint32_t num_h,
+                           uint64_t file_offset, uint64_t size,
+                           uint8_t* dest, const char* label) -> bool {
+        uint64_t bytes_per_handle = (size / num_h / m_sector_size) * m_sector_size;
+        
+        for (uint32_t h = 0; h < num_h; ++h) {
+            uint64_t h_offset = file_offset + h * bytes_per_handle;
+            uint64_t h_size = (h == num_h - 1)
+                ? (size - h * bytes_per_handle)
+                : bytes_per_handle;
+            uint8_t* h_dest = dest + h * bytes_per_handle;
+            HANDLE hFile = static_cast<HANDLE>(handles[h]);
+            
+            uint64_t remaining = h_size;
+            uint64_t current_offset = h_offset;
+            uint8_t* current_dest = h_dest;
+            
+            while (remaining > 0 && op_idx < MAX_ASYNC_OPS) {
+                DWORD chunk = static_cast<DWORD>(
+                    std::min(remaining, static_cast<uint64_t>(256 * 1024 * 1024)));
+                
+                OVERLAPPED& ov = overlapped_arr[op_idx];
+                memset(&ov, 0, sizeof(OVERLAPPED));
+                ov.Offset = static_cast<DWORD>(current_offset & 0xFFFFFFFF);
+                ov.OffsetHigh = static_cast<DWORD>(current_offset >> 32);
+                ov.hEvent = static_cast<HANDLE>(m_io_events[op_idx]);
+                ResetEvent(ov.hEvent);
+                
+                BOOL result = ReadFile(hFile, current_dest, chunk, nullptr, &ov);
+                if (!result) {
+                    DWORD err = GetLastError();
+                    if (err != ERROR_IO_PENDING) {
+                        std::cerr << "[DenseStreaming] Dual async ReadFile failed (" << label
+                                  << ") at offset " << current_offset << ": error " << err << "\n";
+                        m_async_num_ops = op_idx;
+                        m_async_in_progress.store(false);
+                        return false;
+                    }
+                }
+                
+                remaining -= chunk;
+                current_offset += chunk;
+                current_dest += chunk;
+                ++op_idx;
+            }
+            
+            if (remaining > 0) {
+                std::cerr << "[DenseStreaming] Dual: too many async ops (" << label << ")\n";
+                m_async_num_ops = op_idx;
+                m_async_in_progress.store(false);
+                return false;
+            }
+        }
+        return true;
+    };
+    
+    // Issue reads for file 0 (first half) → dest[0..size_0)
+    uint8_t* dest = static_cast<uint8_t*>(dest_ptr);
+    if (!issue_reads(m_io_handles, num_handles_0, gt0.file_offset, size_0, dest, "NVMe0")) {
+        return false;
+    }
+    
+    // Issue reads for file 1 (second half) → dest[size_0..size_0+size_1)
+    if (!issue_reads(m_io_handles_2, num_handles_1, gt1.file_offset, size_1, dest + size_0, "NVMe1")) {
+        return false;
+    }
+    
+    m_async_num_ops = op_idx;
+    m_async_in_progress.store(true);
+    
+    if (m_config.debug_logging) {
+        fprintf(debug_log_file(),
+                "[DenseStreaming] start_async_load_dual: group %u, %u ops "
+                "(NVMe0: %.2f MB @ offset %llu, NVMe1: %.2f MB @ offset %llu)\n",
+                group_idx, op_idx,
+                size_0 / (1024.0*1024.0), (unsigned long long)gt0.file_offset,
+                size_1 / (1024.0*1024.0), (unsigned long long)gt1.file_offset);
     }
     
     return true;

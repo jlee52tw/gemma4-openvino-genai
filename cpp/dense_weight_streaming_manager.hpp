@@ -85,7 +85,7 @@ namespace ov::intel_gpu {
 
 /// @brief Magic number for dense weight streaming binary file
 static constexpr char DNSW_MAGIC[4] = {'D', 'N', 'S', 'W'};
-static constexpr uint32_t DNSW_VERSION = 1;
+static constexpr uint32_t DNSW_VERSION = 2;  // V2: dual-NVMe striping support
 static constexpr size_t SECTOR_SIZE = 4096;
 
 /// @brief File header (padded to 4096 bytes for sector alignment)
@@ -286,6 +286,25 @@ struct DenseStreamingConfig {
     /// synchronously before GPU compute — no pipelining. Set via
     /// OV_DENSE_STREAM_NO_PREFETCH=1. Useful for v1-vs-v2 comparison.
     bool no_prefetch = false;
+
+    // ====================================================================
+    // Dual-NVMe Striping (2× bandwidth)
+    // ====================================================================
+    // When weights_file_path_2 is set, the manager reads from 2 NVMe files
+    // simultaneously (group-half striping). Each group's data is split:
+    //   - File 0 (weights_file_path): first half of each group
+    //   - File 1 (weights_file_path_2): second half of each group
+    // IO handles are split evenly: handles[0..N/2-1] → file 0,
+    //   handles[N/2..N-1] → file 1.
+    // Combined bandwidth: ~24 GB/s (2× single NVMe).
+    //
+    // Set via: OV_DENSE_STREAM_WEIGHTS_2=D:\path\to\stripe_1.bin
+
+    /// Path to second NVMe stripe file (empty = single-NVMe mode)
+    std::string weights_file_path_2;
+
+    /// @brief Check if dual-NVMe mode is active
+    bool is_dual_nvme() const { return !weights_file_path_2.empty(); }
     
     /// @brief First streamed layer index: pin_head_layers
     uint32_t first_streamed_layer() const { return pin_head_layers; }
@@ -630,6 +649,9 @@ private:
     /// @brief Read group table and layer table from file
     bool read_tables();
     
+    /// @brief Read group table from second stripe file (dual-NVMe)
+    bool read_tables_file2();
+    
     /// @brief Allocate double-buffer USM host memory
     bool allocate_buffers();
     
@@ -667,6 +689,16 @@ private:
     /// async ReadFile + OVERLAPPED + Event. Returns immediately — the NVMe
     /// controller performs DMA in the background.
     bool start_async_load(uint64_t file_offset, uint64_t size, void* dest_ptr);
+    
+    /// @brief Issue async ReadFile calls across 2 NVMe files (dual-NVMe mode)
+    /// @param group_idx Group index — used to look up per-file offsets/sizes
+    /// @param dest_ptr Destination USM host pointer (contiguous buffer)
+    /// @return true if all async IO operations were submitted successfully
+    ///
+    /// Reads first half from file 0 into dest[0..size_0), second half from
+    /// file 1 into dest[size_0..size_0+size_1). Both reads run in parallel
+    /// using separate file handles for each NVMe, achieving ~2x bandwidth.
+    bool start_async_load_dual(uint32_t group_idx, void* dest_ptr);
     
     /// @brief Wait for all outstanding async ReadFile operations to complete
     /// @return true if all operations completed successfully
@@ -711,8 +743,14 @@ private:
     
     // Direct I/O file handles (one per IO handle for concurrent async reads)
     // Opened with FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED
-    std::vector<void*> m_io_handles;  // HANDLE[], size = num_io_threads
+    std::vector<void*> m_io_handles;    // HANDLE[], file 0 (or all in single mode)
+    std::vector<void*> m_io_handles_2;  // HANDLE[], file 1 (dual-NVMe only)
     size_t m_sector_size = SECTOR_SIZE;
+
+    // Dual-NVMe: per-file group table (file_offset and aligned_bytes differ per stripe)
+    std::vector<GroupTableEntry> m_group_table_2;  // Group table from stripe file 1
+    // Full group aligned sizes (for buffer allocation, sum of both stripes)
+    std::vector<uint64_t> m_full_group_aligned_bytes;
     
     // Async I/O state (FILE_FLAG_OVERLAPPED based)
     // Replaces std::thread prefetch with native kernel-level async I/O.

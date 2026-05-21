@@ -1,0 +1,1 @@
+Explain how a transformer attention block computes its output in plain English. Cover queries, keys, values, scaled dot-product, masking, and the softmax. Keep it concise.

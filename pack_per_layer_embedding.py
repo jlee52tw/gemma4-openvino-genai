@@ -34,36 +34,48 @@ from pathlib import Path
 
 # Constants
 MAGIC = b"PLEB"  # Per-Layer EMBedding
-VERSION = 1
+VERSION_V1 = 1    # INT8 weight | FP16 scale (q4_0 model, no zero-point)
+VERSION_V2 = 2    # UINT8 weight | UINT8 ZP | FP16 scale (w4a16-ct model)
+VERSION = VERSION_V1  # default for write_header; overridden in pack()
 VOCAB_SIZE = 262144
 PER_LAYER_DIM = 10752      # 42 * 256
 NUM_LAYERS = 42
 LAYER_DIM = 256
-WEIGHT_DTYPE_INT8 = 1
-SCALE_DTYPE_FP16 = 2
-ROW_STRIDE = 12288         # 3 * 4096
-HEADER_SIZE = 4096         # 1 page
-WEIGHT_ROW_SIZE = 10752    # INT8 bytes per row
-SCALE_ROW_SIZE = 2         # FP16 bytes per row
-PAD_SIZE = ROW_STRIDE - WEIGHT_ROW_SIZE - SCALE_ROW_SIZE  # 1534
+WEIGHT_DTYPE_INT8  = 1
+WEIGHT_DTYPE_UINT8 = 3
+SCALE_DTYPE_FP16   = 2
+ZP_DTYPE_NONE   = 0   # no zero-point (v1)
+ZP_DTYPE_UINT8  = 1   # UINT8 zero-point per row (v2)
+ROW_STRIDE       = 12288         # 3 * 4096 (same for both versions)
+HEADER_SIZE      = 4096         # 1 page
+WEIGHT_ROW_SIZE  = 10752    # bytes per row
+ZP_ROW_SIZE      = 1        # v2 only: UINT8 zero-point byte
+SCALE_ROW_SIZE   = 2         # FP16 bytes per row
+# v1: [weight(10752) | scale(2) | pad(1534)]
+# v2: [weight(10752) | zp(1)    | scale(2) | pad(1533)]
+PAD_SIZE_V1 = ROW_STRIDE - WEIGHT_ROW_SIZE - SCALE_ROW_SIZE                        # 1534
+PAD_SIZE_V2 = ROW_STRIDE - WEIGHT_ROW_SIZE - ZP_ROW_SIZE - SCALE_ROW_SIZE          # 1533
 POST_GATHER_SCALE = 16.0   # Gemma4 per-layer model applies ×16 after Gather+dequant
 
 # Special token IDs that get remapped to row 0 (from IR graph Equal comparisons)
 SPECIAL_TOKEN_REMAP = {258880: 0, 258884: 0, 258881: 0}
 
 
-def write_header(f, vocab_size, per_layer_dim, num_layers, layer_dim):
+def write_header(f, vocab_size, per_layer_dim, num_layers, layer_dim, version=VERSION_V1):
     """Write 4096-byte header."""
+    weight_dtype = WEIGHT_DTYPE_INT8 if version == VERSION_V1 else WEIGHT_DTYPE_UINT8
+    zp_dtype     = ZP_DTYPE_NONE     if version == VERSION_V1 else ZP_DTYPE_UINT8
     header = bytearray(HEADER_SIZE)
     struct.pack_into("4s", header, 0, MAGIC)
-    struct.pack_into("<I", header, 4, VERSION)
+    struct.pack_into("<I", header, 4, version)
     struct.pack_into("<I", header, 8, vocab_size)
     struct.pack_into("<I", header, 12, per_layer_dim)
     struct.pack_into("<I", header, 16, num_layers)
     struct.pack_into("<I", header, 20, layer_dim)
-    struct.pack_into("<I", header, 24, WEIGHT_DTYPE_INT8)
+    struct.pack_into("<I", header, 24, weight_dtype)
     struct.pack_into("<I", header, 28, SCALE_DTYPE_FP16)
     struct.pack_into("<I", header, 32, ROW_STRIDE)
+    struct.pack_into("<I", header, 36, zp_dtype)  # v2: UINT8 ZP
     f.write(header)
 
 
@@ -78,7 +90,7 @@ def read_header(f):
         raise ValueError("Bad magic: %s (expected %s)" % (magic, MAGIC))
 
     version = struct.unpack_from("<I", header, 4)[0]
-    if version != VERSION:
+    if version not in (VERSION_V1, VERSION_V2):
         raise ValueError("Unsupported version: %d" % version)
 
     return {
@@ -90,6 +102,7 @@ def read_header(f):
         "weight_dtype": struct.unpack_from("<I", header, 24)[0],
         "scale_dtype": struct.unpack_from("<I", header, 28)[0],
         "row_stride": struct.unpack_from("<I", header, 32)[0],
+        "zp_dtype": struct.unpack_from("<I", header, 36)[0],
     }
 
 
@@ -102,59 +115,102 @@ def pack(model_dir: Path, output_path: Path, verify: bool = False):
 
     file_size = bin_path.stat().st_size
     weight_bytes = VOCAB_SIZE * WEIGHT_ROW_SIZE
-    scale_bytes = VOCAB_SIZE * SCALE_ROW_SIZE
+    zp_bytes     = VOCAB_SIZE * ZP_ROW_SIZE
+    scale_bytes  = VOCAB_SIZE * SCALE_ROW_SIZE
+
+    # Auto-detect format version from file size
+    v1_size = weight_bytes + scale_bytes                    # 2,819,096,576
+    v2_size = weight_bytes + zp_bytes + scale_bytes         # 2,819,358,720
+    if abs(file_size - v2_size) < 4096:
+        fmt_version  = VERSION_V2
+        scale_offset = weight_bytes + zp_bytes              # 2,818,834,432
+        zp_offset    = weight_bytes                         # 2,818,572,288
+        pad_size     = PAD_SIZE_V2                          # 1533
+        weight_dtype_name = "UINT8"
+    else:
+        fmt_version  = VERSION_V1
+        scale_offset = weight_bytes                         # no ZP section
+        zp_offset    = None
+        pad_size     = PAD_SIZE_V1                          # 1534
+        weight_dtype_name = "INT8"
+
     print("Input:  %s (%.3f GB)" % (bin_path, file_size / 1e9))
-    print("Weight: [%d, %d] INT8 at offset 0, size %d bytes" % (
-        VOCAB_SIZE, PER_LAYER_DIM, weight_bytes))
-    print("Scale:  [%d, 1] FP16 at offset %d, size %d bytes" % (
-        VOCAB_SIZE, weight_bytes, scale_bytes))
+    print("Format: v%d (%s weight, %s ZP)" % (
+        fmt_version, weight_dtype_name,
+        "UINT8" if fmt_version == VERSION_V2 else "none"))
+    print("Weight: [%d, %d] %s at offset 0, size %d bytes" % (
+        VOCAB_SIZE, PER_LAYER_DIM, weight_dtype_name, weight_bytes))
+    if zp_offset is not None:
+        print("ZP:     [%d, 1] UINT8 at offset %d, size %d bytes" % (
+            VOCAB_SIZE, zp_offset, zp_bytes))
+    print("Scale:  [%d, 1] FP16  at offset %d, size %d bytes" % (
+        VOCAB_SIZE, scale_offset, scale_bytes))
     print("Output: %s" % output_path)
     print("Row stride: %d bytes (%d pages)" % (ROW_STRIDE, ROW_STRIDE // 4096))
     expected_output_size = HEADER_SIZE + VOCAB_SIZE * ROW_STRIDE
     print("Expected output: %.3f GB" % (expected_output_size / 1e9))
     print()
 
-    # Read scale tensor entirely (only 512 KB)
+    # Read scale tensor entirely (~512 KB)
     print("Reading scale tensor...")
     with open(bin_path, "rb") as f:
-        f.seek(weight_bytes)
+        f.seek(scale_offset)
         scale_raw = f.read(scale_bytes)
     if len(scale_raw) != scale_bytes:
         print("ERROR: Scale read incomplete: %d / %d" % (len(scale_raw), scale_bytes))
         sys.exit(1)
     scales = np.frombuffer(scale_raw, dtype=np.float16)  # [262144]
-    print("  Scale range: [%.6f, %.6f]" % (scales.min(), scales.max()))
+    finite_scales = scales[np.isfinite(scales.astype(np.float32))]
+    print("  Scale range: [%.6f, %.6f]  NaN count: %d" % (
+        finite_scales.min() if len(finite_scales) else float('nan'),
+        finite_scales.max() if len(finite_scales) else float('nan'),
+        (VOCAB_SIZE - len(finite_scales))))
 
-    # Process in chunks to limit memory
-    CHUNK_ROWS = 8192  # ~85 MB read + ~96 MB write buffer per chunk
+    # Read ZP tensor entirely (~256 KB, only for v2)
+    if fmt_version == VERSION_V2:
+        print("Reading zero-point tensor...")
+        with open(bin_path, "rb") as f:
+            f.seek(zp_offset)
+            zp_raw = f.read(zp_bytes)
+        if len(zp_raw) != zp_bytes:
+            print("ERROR: ZP read incomplete: %d / %d" % (len(zp_raw), zp_bytes))
+            sys.exit(1)
+        zps = np.frombuffer(zp_raw, dtype=np.uint8)  # [262144] unsigned
+        print("  ZP range: [%d, %d]" % (zps.min(), zps.max()))
+    else:
+        zps = None
+
+    # Process in chunks
+    CHUNK_ROWS = 8192
     num_chunks = (VOCAB_SIZE + CHUNK_ROWS - 1) // CHUNK_ROWS
-    pad_bytes = bytes(PAD_SIZE)
+    pad_bytes_buf = bytes(pad_size)
 
     print("Packing %d rows in %d chunks of %d..." % (VOCAB_SIZE, num_chunks, CHUNK_ROWS))
     t0 = time.time()
 
     with open(bin_path, "rb") as fin, open(output_path, "wb") as fout:
         # Write header
-        write_header(fout, VOCAB_SIZE, PER_LAYER_DIM, NUM_LAYERS, LAYER_DIM)
+        write_header(fout, VOCAB_SIZE, PER_LAYER_DIM, NUM_LAYERS, LAYER_DIM,
+                     version=fmt_version)
 
         for chunk_idx in range(num_chunks):
             row_start = chunk_idx * CHUNK_ROWS
             row_end = min(row_start + CHUNK_ROWS, VOCAB_SIZE)
             n_rows = row_end - row_start
 
-            # Read weight chunk
             fin.seek(row_start * WEIGHT_ROW_SIZE)
             weight_chunk = fin.read(n_rows * WEIGHT_ROW_SIZE)
 
-            # Write interleaved rows
             for i in range(n_rows):
                 row_idx = row_start + i
                 w_start = i * WEIGHT_ROW_SIZE
-                w_data = weight_chunk[w_start:w_start + WEIGHT_ROW_SIZE]
-                s_data = scales[row_idx].tobytes()  # 2 bytes FP16
+                w_data  = weight_chunk[w_start:w_start + WEIGHT_ROW_SIZE]
+                s_data  = scales[row_idx].tobytes()          # 2 bytes FP16
                 fout.write(w_data)
+                if fmt_version == VERSION_V2:
+                    fout.write(bytes([int(zps[row_idx])]))
                 fout.write(s_data)
-                fout.write(pad_bytes)
+                fout.write(pad_bytes_buf)
 
             if (chunk_idx + 1) % 4 == 0 or chunk_idx == num_chunks - 1:
                 pct = (row_end / VOCAB_SIZE) * 100
@@ -168,7 +224,6 @@ def pack(model_dir: Path, output_path: Path, verify: bool = False):
     print("Done! Output: %.3f GB in %.1f s (%.1f MB/s write)" % (
         output_size / 1e9, elapsed, output_size / 1e6 / elapsed))
 
-    # Validate output size
     if output_size != expected_output_size:
         print("WARNING: Output size mismatch! Expected %d, got %d" % (
             expected_output_size, output_size))
@@ -180,19 +235,34 @@ def pack(model_dir: Path, output_path: Path, verify: bool = False):
 
 
 def lookup_row(f, token_id: int, meta: dict) -> tuple:
-    """Read one row from repacked binary. Returns (weight_int8[10752], scale_fp16)."""
+    """Read one row from repacked binary.
+    Returns (weight[10752], zp: int|None, scale_fp16) per meta version."""
     offset = HEADER_SIZE + token_id * meta["row_stride"]
     f.seek(offset)
     row_data = f.read(meta["row_stride"])
-    weight = np.frombuffer(row_data[:meta["per_layer_dim"]], dtype=np.int8)
-    scale = np.frombuffer(row_data[meta["per_layer_dim"]:meta["per_layer_dim"] + 2],
-                          dtype=np.float16)[0]
-    return weight, scale
+    pld = meta["per_layer_dim"]
+    if meta.get("zp_dtype", ZP_DTYPE_NONE) == ZP_DTYPE_UINT8:
+        # v2: [uint8 weight | uint8 zp | fp16 scale | pad]
+        weight = np.frombuffer(row_data[:pld], dtype=np.uint8)
+        zp = int(row_data[pld])
+        scale = np.frombuffer(row_data[pld+1:pld+3], dtype=np.float16)[0]
+    else:
+        # v1: [int8 weight | fp16 scale | pad]
+        weight = np.frombuffer(row_data[:pld], dtype=np.int8)
+        zp = None
+        scale = np.frombuffer(row_data[pld:pld+2], dtype=np.float16)[0]
+    return weight, zp, scale
 
 
-def dequant_row(weight_int8: np.ndarray, scale_fp16) -> np.ndarray:
-    """Dequantize: int8 × fp16_scale × POST_GATHER_SCALE → fp32[10752]."""
-    return weight_int8.astype(np.float32) * float(scale_fp16) * POST_GATHER_SCALE
+def dequant_row(weight: np.ndarray, zp, scale_fp16) -> np.ndarray:
+    """Dequantize one row → fp32[10752].
+    v1 (zp=None): int8 × scale × POST_GATHER_SCALE
+    v2 (zp=int):  (uint8 - zp) × scale × POST_GATHER_SCALE
+    """
+    if zp is None:
+        return weight.astype(np.float32) * float(scale_fp16) * POST_GATHER_SCALE
+    else:
+        return (weight.astype(np.int16) - zp).astype(np.float32) * float(scale_fp16) * POST_GATHER_SCALE
 
 
 def resolve_token_id(token_id: int) -> int:
@@ -256,8 +326,8 @@ def verify_repacked(model_dir: Path, repacked_path: Path, num_samples: int = 20)
             if resolved < 0:
                 our_output = np.zeros((1, 1, NUM_LAYERS, LAYER_DIM), dtype=np.float32)
             else:
-                weight, scale = lookup_row(f, resolved, meta)
-                our_output = dequant_row(weight, scale).reshape(1, 1, NUM_LAYERS, LAYER_DIM)
+                weight, zp, scale = lookup_row(f, resolved, meta)
+                our_output = dequant_row(weight, zp, scale).reshape(1, 1, NUM_LAYERS, LAYER_DIM)
 
             # Compare
             abs_err = np.abs(ref_output - our_output).max()
@@ -303,13 +373,10 @@ def verify_binary_consistency(model_dir: Path, repacked_path: Path, num_samples:
             # Read from original
             forig.seek(token_id * WEIGHT_ROW_SIZE)
             orig_weight = forig.read(WEIGHT_ROW_SIZE)
-            forig.seek(scale_offset + token_id * 2)
-            orig_scale = forig.read(2)
 
             # Read from repacked
-            weight, scale = lookup_row(frep, token_id, meta)
+            weight, zp, scale = lookup_row(frep, token_id, meta)
             rep_weight = weight.tobytes()
-            rep_scale = np.float16(scale).tobytes()
 
             w_match = orig_weight == rep_weight
             s_match = orig_scale == rep_scale

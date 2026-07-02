@@ -822,3 +822,100 @@ Tensors per layer:     14
 - [ ] Memory reduction test: deallocate streamed layer weights, measure RSS savings
 - [ ] NVMe→USM Direct I/O streaming benchmark with double-buffered pipeline
 - [ ] Full 8 GB system validation
+
+---
+
+## Session — July 1, 2026 (Part 2): Per-Layer Embedding DirectIO Offload
+
+> **Goal:** Build OV GenAI 2026.2 from source with per-layer embedding (PLE) offload using
+> Win32 `FILE_FLAG_NO_BUFFERING` (true DirectIO, not mmap). Target model: `gemma-4-E4B-it-ov-qat-w4a16`.
+
+### What Was Done
+
+#### Source Patches Applied
+
+**New file:** `openvino_genai_src/src/cpp/src/visual_language/gemma4/per_layer_embedding_reader.hpp`
+- Win32 DirectIO reader class (`FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN`)
+- VirtualAlloc'd 4096-byte-aligned I/O buffer (satisfies NVMe sector alignment)
+- Per-token positional read via `ReadFile` with OVERLAPPED struct (avoids `SetFilePointerEx` race)
+- **Version-aware dequant:**
+  - v1 (INT8 weight, no ZP): `float(int8[i]) × fp16_scale × 16.0f`
+  - v2 (UINT8 weight + UINT8 ZP): `(float(uint8[i]) − float(uint8_zp)) × fp16_scale × 16.0f`
+- POSIX fallback (`O_DIRECT` + `pread`) for Linux portability
+
+**Modified:** `classes.hpp`
+- Added `#include "visual_language/gemma4/per_layer_embedding_reader.hpp"`
+- Added `std::unique_ptr<PerLayerEmbeddingReader> m_per_layer_reader` member
+
+**Modified:** `classes.cpp`
+- Constructor detects `per_layer_embedding_directio.bin` in model dir → creates `PerLayerEmbeddingReader`
+- `get_per_layer_embeddings()` dispatches to reader (CPU DirectIO) or GPU compiled model
+
+#### Build
+```powershell
+cmake -B build -G "Visual Studio 17 2022" `
+    "-DOpenVINO_DIR=C:\working\gemma4\openvino_genai_windows_2026.2.0.0_x86_64\runtime\cmake" `
+    -DENABLE_PYTHON=OFF -DENABLE_JS=OFF -DENABLE_TESTS=OFF -DENABLE_TOOLS=OFF `
+    -DENABLE_SAMPLES=OFF -DENABLE_GGUF=ON -DENABLE_XGRAMMAR=OFF
+cmake --build build --target openvino_genai --config Release -- /p:CL_MPCount=6
+```
+- Build issue: `NOMINMAX` missing → added `#define NOMINMAX` before `#include <windows.h>`
+- `ENABLE_GGUF=ON` required because `gguf_tokenizer.cpp` (not excluded by `ENABLE_GGUF=OFF`) includes `gguf.hpp` → `gguflib.h` (pre-existing source tree bug)
+- Output: `build\openvino_genai\openvino_genai.dll` (4.85 MB)
+
+**Deploy:** `Copy-Item` to `.venv\Lib\site-packages\openvino_genai\openvino_genai.dll`
+- Original backed up as `openvino_genai.dll.bak_official`
+
+#### Binary Format Discovery for w4a16-ct
+
+IR constant layout (from `inspect_consts.py`):
+```
+offset           0 : UINT8 weight [262144, 10752] = 2,818,572,288 bytes
+offset 2818572288 : UINT8 zero-point [262144, 1]  =     262,144 bytes  ← NEW vs q4_0
+offset 2818834432 : FP16  scale      [262144, 1]  =     524,288 bytes
+offset 2819358764 : FP32 POST_GATHER_SCALE = 16.0 (constant Constant_2633102)
+```
+
+Format is **v2** (version=2 in PLEB header, `zp_dtype=1` at offset 36).
+
+**Updated `pack_per_layer_embedding.py`:**
+- Auto-detects v1 vs v2 from file size
+- v2 row: `[UINT8 weight (10752) | UINT8 ZP (1) | FP16 scale (2) | pad (1533)]` = 12288 bytes
+- Header offset 36: `zp_dtype` field (0=none, 1=UINT8)
+
+**Verification result (20 random tokens):**
+```
+Max absolute error: 0.000000   ✅ All 20 samples PASS
+```
+
+#### Benchmark Results (w4a16-ct, GPU, DirectIO PLE)
+
+| Prompt | Tok/s (runs) | TTFT | RSS | vs baseline |
+|--------|-------------|------|-----|-------------|
+| short-text (7 tok) | 25.29 / 25.18 / 24.98 | ~0.30s | 4.41 GB | +8.5% ↑ |
+| long-text (1024 tok) | 20.63 / 19.91 / 18.63 | ~0.86s | 4.97 GB | −7% ↓ |
+| short-image | 21.88 / 22.01 / 22.00 | ~0.53s | 5.23 GB | −11% ↓ |
+
+Baseline (w4a16-ct, GPU compiled per-layer model): 23.31 / 21.15 / 24.62 tok/s
+
+**Observations:**
+- Short-text is faster because GPU no longer competes with per-layer model for compute bandwidth
+- Long-text regresses due to sequential NVMe reads for 1024 tokens (12.5 MB of DirectIO I/O at TTFT)
+- DirectIO reads happen synchronously before generation starts (all tokens embedded at once)
+- RSS is similar — the 3.22 GB DirectIO bin is not mapped into RSS
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `openvino_genai_src/src/cpp/src/visual_language/gemma4/per_layer_embedding_reader.hpp` | Win32 DirectIO reader |
+| `models/gemma-4-E4B-it-ov-qat-w4a16/per_layer_embedding_directio.bin` | Packed PLE binary (3.22 GB, v2) |
+| `.venv/Lib/site-packages/openvino_genai/openvino_genai.dll` | Patched DLL (4.85 MB) |
+| `.venv/Lib/site-packages/openvino_genai/openvino_genai.dll.bak_official` | Original DLL backup |
+
+### Potential Next Steps
+
+- [ ] Investigate async/overlapped DirectIO with pre-fetch buffer to reduce long-context TTFT penalty
+- [ ] Batch multiple token reads per OVERLAPPED call to amortize I/O overhead
+- [ ] Profile: how much of the long-text TTFT is DirectIO vs. tokenizer vs. model TTFT?
+- [ ] Test on 8 GB system to verify RSS reduction compared to GPU compiled per-layer model

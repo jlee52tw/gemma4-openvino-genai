@@ -1,0 +1,85 @@
+Gemma 4 VLMPipeline Benchmark — 2026-07-02 09:54:41
+openvino_genai version: 2026.2.0.0-3030-4f296476d4f-as/vlm_enable_1
+
+===========================================================================
+  PROMPT VALIDATION
+===========================================================================
+  Raw long text: 1780 tokens
+  Trimmed long prompt: 1024 tokens (target: 1024)
+  SHORT prompt: 7 tokens
+  LONG  prompt: 1024 tokens
+
+===========================================================================
+  gemma-4-E4B-it-ov-qat-w4a16 | short-text | GPU
+===========================================================================
+  Loading VLMPipeline: gemma-4-E4B-it-ov-qat-w4a16 on GPU...
+  Model loaded in 9.1s, RSS: 4.23 GB
+    Warmup 1/1...
+    Run 1/3: 118 tokens in 4.69s (25.14 tok/s), TTFT=0.280s, RSS=4.29GB
+    Run 2/3: 118 tokens in 4.71s (25.04 tok/s), TTFT=0.277s, RSS=4.29GB
+    Run 3/3: 118 tokens in 4.89s (24.15 tok/s), TTFT=0.279s, RSS=4.29GB
+  [OK] 25.14 tok/s
+  [OK] 25.04 tok/s
+  [OK] 24.15 tok/s
+
+===========================================================================
+  gemma-4-E4B-it-ov-qat-w4a16 | long-text | GPU
+===========================================================================
+  Loading VLMPipeline: gemma-4-E4B-it-ov-qat-w4a16 on GPU...
+  Model loaded in 9.8s, RSS: 4.36 GB
+    Warmup 1/1...
+    Run 1/3: 116 tokens in 6.10s (19.02 tok/s), TTFT=0.999s, RSS=4.87GB
+    Run 2/3: 116 tokens in 6.09s (19.06 tok/s), TTFT=0.940s, RSS=4.87GB
+    Run 3/3: 116 tokens in 6.47s (17.93 tok/s), TTFT=0.941s, RSS=4.87GB
+  [OK] 19.02 tok/s
+  [OK] 19.06 tok/s
+  [OK] 17.93 tok/s
+
+===========================================================================
+  gemma-4-E4B-it-ov-qat-w4a16 | short-image | GPU
+===========================================================================
+  Loading VLMPipeline: gemma-4-E4B-it-ov-qat-w4a16 on GPU...
+  Model loaded in 9.3s, RSS: 4.83 GB
+    Warmup 1/1...
+    Run 1/3: 116 tokens in 4.97s (23.35 tok/s), TTFT=0.469s, RSS=5.12GB
+    Run 2/3: 116 tokens in 5.28s (21.97 tok/s), TTFT=0.546s, RSS=5.12GB
+    Run 3/3: 116 tokens in 5.26s (22.07 tok/s), TTFT=0.562s, RSS=5.12GB
+  [OK] 23.35 tok/s
+  [OK] 21.97 tok/s
+  [OK] 22.07 tok/s
+
+===========================================================================
+  RESULTS
+===========================================================================
++-----------------------------+-------------+--------+-------+--------+---------+----------+-------+---------+--------+
+| Model                       | Prompt      | Device | InTok | OutTok | TTFT(s) | Total(s) | Tok/s | RSS(GB) | Status |
++-----------------------------+-------------+--------+-------+--------+---------+----------+-------+---------+--------+
+| gemma-4-E4B-it-ov-qat-w4a16 | short-text  | GPU    | 7     | 118    | 0.280   | 4.69     | 25.14 | 4.29    | OK     |
+| gemma-4-E4B-it-ov-qat-w4a16 | short-text  | GPU    | 7     | 118    | 0.277   | 4.71     | 25.04 | 4.29    | OK     |
+| gemma-4-E4B-it-ov-qat-w4a16 | short-text  | GPU    | 7     | 118    | 0.279   | 4.89     | 24.15 | 4.29    | OK     |
+| gemma-4-E4B-it-ov-qat-w4a16 | long-text   | GPU    | 1024  | 116    | 0.999   | 6.10     | 19.02 | 4.87    | OK     |
+| gemma-4-E4B-it-ov-qat-w4a16 | long-text   | GPU    | 1024  | 116    | 0.940   | 6.09     | 19.06 | 4.87    | OK     |
+| gemma-4-E4B-it-ov-qat-w4a16 | long-text   | GPU    | 1024  | 116    | 0.941   | 6.47     | 17.93 | 4.87    | OK     |
+| gemma-4-E4B-it-ov-qat-w4a16 | short-image | GPU    | 7     | 116    | 0.469   | 4.97     | 23.35 | 5.12    | OK     |
+| gemma-4-E4B-it-ov-qat-w4a16 | short-image | GPU    | 7     | 116    | 0.546   | 5.28     | 21.97 | 5.12    | OK     |
+| gemma-4-E4B-it-ov-qat-w4a16 | short-image | GPU    | 7     | 116    | 0.562   | 5.26     | 22.07 | 5.12    | OK     |
++-----------------------------+-------------+--------+-------+--------+---------+----------+-------+---------+--------+
+
+Total: 9 runs | OK: 9 | ERROR: 0
+onednn_verbose,v1,info,oneDNN v3.12.0 (commit 470e87eb07bdc805937a9f6d45d5c3a0fe4d27e7)
+onednn_verbose,v1,info,gpu,runtime:OpenCL
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,info,gpu,engine,opencl device count:2 
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,common,error,runtime,no opencl gpu device is available,src\xpu/ocl/engine_factory.hpp:64
+onednn_verbose,v1,common,error,ocl,invalid gpu device in environment: index 0,src\xpu/ocl/verbose.hpp:46
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,common,error,runtime,no opencl gpu device is available,src\xpu/ocl/engine_factory.hpp:64
+onednn_verbose,v1,common,error,ocl,invalid gpu device in environment: index 1,src\xpu/ocl/verbose.hpp:46
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu\ocl\utils_shared.cpp:199,src\xpu\ocl\utils_shared.cpp:199
+onednn_verbose,v1,primitive,info,template:operation,engine,primitive,implementation,prop_kind,memory_descriptors,attributes,auxiliary,problem_desc,exec_time
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu/ocl/utils.hpp:189,src\xpu/ocl/utils.hpp:189
+onednn_verbose,v1,primitive,error,ocl,errcode -59,CL_INVALID_OPERATION,src\xpu/ocl/utils.hpp:259,src\xpu/ocl/utils.hpp:259

@@ -1,0 +1,19 @@
+model_name,prompt_type,device,input_tokens,output_tokens,max_new_tokens,ttft_s,total_s,tokens_per_sec,peak_rss_gb,status,error_msg,warmup_runs,test_runs,run_index
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,short-text,GPU,7,118,128,0.49341090000234544,4.635729699977674,25.454460815644257,7.187538146972656,OK,,0,3,0
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,short-text,GPU,7,118,128,0.34202639997238293,4.469172200013418,26.403099884950894,7.187557220458984,OK,,0,3,1
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,short-text,GPU,7,118,128,0.28756319999229163,4.275535200024024,27.598883994531718,7.18756103515625,OK,,0,3,2
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,long-text,GPU,1024,116,128,1.0518633000319824,5.040065800014418,23.015572534721308,7.684356689453125,OK,,0,3,0
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,long-text,GPU,1024,116,128,0.5114641999825835,4.666280600009486,24.85919942314746,7.9086151123046875,OK,,0,3,1
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,long-text,GPU,1024,116,128,0.6030619000084698,4.791369599988684,24.21019660021092,7.9086151123046875,OK,,0,3,2
+gemma-4-E4B-it-ov-int4-gs64-johnson,short-text,GPU,7,121,128,0.4969787000445649,4.387466000043787,27.57856129227951,7.4415435791015625,OK,,0,3,0
+gemma-4-E4B-it-ov-int4-gs64-johnson,short-text,GPU,7,121,128,0.2427458000020124,4.224688399990555,28.64116558283222,7.4415435791015625,OK,,0,3,1
+gemma-4-E4B-it-ov-int4-gs64-johnson,short-text,GPU,7,121,128,0.3177764000138268,4.362329100025818,27.737476294322654,7.405242919921875,OK,,0,3,2
+gemma-4-E4B-it-ov-int4-gs64-johnson,long-text,GPU,1024,121,128,1.057250199955888,5.065449199988507,23.887318818689277,7.831371307373047,OK,,0,3,0
+gemma-4-E4B-it-ov-int4-gs64-johnson,long-text,GPU,1024,121,128,0.5242747999727726,4.594255500007421,26.337237883222766,8.054519653320312,OK,,0,3,1
+gemma-4-E4B-it-ov-int4-gs64-johnson,long-text,GPU,1024,121,128,0.609057399968151,4.791446499992162,25.25333424889497,8.055068969726562,OK,,0,3,2
+gemma-4-E4B-it-int4-ov,short-text,GPU,7,0,128,-1.0,0.0,0.0,0.0,ERROR,"Check 'ov::op::util::has_op_with_type<ov::op::v13::ScaledDotProductAttention>(model)' failed at src\core\src\pass\sdpa_to_paged_attention.cpp:81:
+No ScaledDotProductAttention operation observed in the graph, cannot perform the SDPAToPagedAttention transformation.
+",0,0,0
+gemma-4-E4B-it-int4-ov,long-text,GPU,1024,0,128,-1.0,0.0,0.0,0.0,ERROR,"Check 'ov::op::util::has_op_with_type<ov::op::v13::ScaledDotProductAttention>(model)' failed at src\core\src\pass\sdpa_to_paged_attention.cpp:81:
+No ScaledDotProductAttention operation observed in the graph, cannot perform the SDPAToPagedAttention transformation.
+",0,0,0

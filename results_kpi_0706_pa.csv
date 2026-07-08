@@ -1,0 +1,43 @@
+# KPI Benchmark — Gemma 4
+# date: 2026-07-07 16:14:14
+# os: Windows-11-10.0.26200-SP0
+# cpu: Intel64 Family 6 Model 204 Stepping 2, GenuineIntel
+# ram_gb: 95.5
+# ov_runtime: 2026.3.0-22375-093b688ab10
+# ov_genai: 2026.3.0.0-3240-b99a4dd60f5
+# gpu_name: Intel(R) Arc(TM) B390 GPU (iGPU)
+# gpu_mem_gb: 84.84 GB
+# gpu_driver: n/a
+# gpu_eu_count: 96
+# gpu_uarch: 30.0.4
+# ov_genai: 2026.3.0.0-3240-b99a4dd60f5
+# paged_attention: True
+# input_lengths: [512, 1024, 2048, 4096]
+# max_new_tokens: 128
+# warmup: 1  runs: 3
+#
+model_name,target_input_tokens,actual_input_tokens,actual_output_tokens,max_new_tokens,device,run_index,warmup_runs,paged_attention,ttft_ms,prefill_tps,tpot_ms,decode_tps,e2e_tps,total_ms,tokenize_ms,peak_rss_gb,status,error_msg
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,512,477,128,128,GPU,0,1,True,301.5,1582.1,31.17,32.1,32.09,4261.5,0.85,7.878,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,512,477,128,128,GPU,1,1,True,272.7,1749.1,31.33,31.9,31.92,4252.8,0.62,7.878,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,512,477,128,128,GPU,2,1,True,248.3,1921.1,31.44,31.8,31.81,4243.1,0.63,7.878,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,1024,989,128,128,GPU,0,1,True,398.5,2481.6,33.17,30.1,30.14,4616.3,0.61,8.096,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,1024,989,128,128,GPU,1,1,True,468.0,2113.1,33.49,29.8,29.86,4726.8,0.67,8.096,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,1024,989,128,128,GPU,2,1,True,506.7,1951.7,34.44,29.0,29.04,4884.5,0.82,8.047,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,2048,2013,128,128,GPU,0,1,True,824.0,2443.0,34.83,28.7,28.71,5255.8,0.76,8.651,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,2048,2013,128,128,GPU,1,1,True,837.5,2403.5,34.8,28.7,28.74,5266.3,0.7,8.651,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,2048,2013,128,128,GPU,2,1,True,896.7,2244.8,34.63,28.8,28.88,5302.5,0.77,8.575,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,4096,4061,128,128,GPU,0,1,True,1764.6,2301.3,34.58,28.8,28.92,6172.8,0.9,9.764,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,4096,4061,128,128,GPU,1,1,True,1795.9,2261.3,34.82,28.6,28.72,6233.5,0.86,9.628,OK,
+gemma-4-E4B-it-qat-ov-int4-gs64-johnson,4096,4061,128,128,GPU,2,1,True,1800.2,2255.9,34.71,28.7,28.81,6226.3,0.83,9.486,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,512,477,128,128,GPU,0,1,True,267.1,1786.1,32.44,30.8,30.82,4389.6,0.54,8.086,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,512,477,128,128,GPU,1,1,True,314.6,1516.0,32.52,30.7,30.75,4448.0,0.61,8.086,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,512,477,128,128,GPU,2,1,True,305.2,1562.8,32.28,31.0,30.98,4408.0,0.7,8.086,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,1024,989,128,128,GPU,0,1,True,441.0,2242.8,33.12,30.2,30.19,4651.8,0.65,8.324,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,1024,989,128,128,GPU,1,1,True,459.6,2151.7,33.1,30.2,30.21,4667.9,0.62,8.324,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,1024,989,128,128,GPU,2,1,True,461.9,2141.1,33.03,30.2,30.27,4661.3,0.63,8.276,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,2048,2013,128,128,GPU,0,1,True,829.5,2426.8,34.73,28.7,28.8,5247.6,0.7,8.833,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,2048,2013,128,128,GPU,1,1,True,845.4,2381.1,34.65,28.8,28.86,5254.3,0.89,8.833,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,2048,2013,128,128,GPU,2,1,True,831.1,2422.0,34.59,28.9,28.91,5232.3,0.78,8.76,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,4096,4061,128,128,GPU,0,1,True,1797.0,2259.9,34.93,28.5,28.63,6248.8,1.16,9.935,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,4096,4061,128,128,GPU,1,1,True,1790.5,2268.1,34.88,28.6,28.67,6235.6,0.98,9.799,OK,
+gemma-4-E4B-it-ov-int4-gs64-johnson,4096,4061,128,128,GPU,2,1,True,1799.4,2256.9,34.84,28.6,28.7,6240.9,0.91,9.655,OK,

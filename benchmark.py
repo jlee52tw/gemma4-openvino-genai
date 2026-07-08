@@ -14,6 +14,9 @@ Usage:
   python benchmark.py --model-dir ./gemma-4-E2B-it-ov ./gemma-4-E4B-it-ov \
                       --device GPU --max-new-tokens 128 --warmup 1 --runs 3 \
                       --output-csv results.csv
+
+  # OV 2026.3 0706+ PagedAttention / text-only:
+  python benchmark.py --model-dir ./model --device GPU --paged-attention --text-only
 """
 
 import argparse
@@ -305,14 +308,23 @@ def bench_vlm(
     warmup_runs: int,
     test_runs: int,
     image=None,
+    use_paged_attention: bool = False,
 ) -> List[BenchResult]:
     """Run warmup + measured runs for one model × prompt combination."""
     import openvino_genai as ov_genai
     results: List[BenchResult] = []
 
-    print(f"  Loading VLMPipeline: {model_name} on {device}...")
+    pa_label = " [PagedAttention]" if use_paged_attention else ""
+    print(f"  Loading VLMPipeline: {model_name} on {device}{pa_label}...")
     t0 = time.perf_counter()
-    pipe = ov_genai.VLMPipeline(str(model_dir), device)
+    if use_paged_attention and device != "NPU":
+        import sys as _sys
+        scheduler_config = ov_genai.SchedulerConfig()
+        scheduler_config.enable_prefix_caching = False
+        scheduler_config.max_num_batched_tokens = _sys.maxsize
+        pipe = ov_genai.VLMPipeline(str(model_dir), device, scheduler_config=scheduler_config)
+    else:
+        pipe = ov_genai.VLMPipeline(str(model_dir), device)
     print(f"  Model loaded in {time.perf_counter() - t0:.1f}s, RSS: {get_rss_gb():.2f} GB")
 
     config = ov_genai.GenerationConfig()
@@ -386,6 +398,14 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--output-csv", default=None)
+    parser.add_argument(
+        "--paged-attention", action="store_true",
+        help="Enable ContinuousBatching/PagedAttention via SchedulerConfig (OV GenAI 0706+)",
+    )
+    parser.add_argument(
+        "--text-only", action="store_true",
+        help="Skip image prompt; run short-text and long-text only",
+    )
     args = parser.parse_args()
 
     print(f"Gemma 4 VLMPipeline Benchmark — {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -419,8 +439,9 @@ def main():
     prompts = [
         (SHORT_PROMPT, "short-text",  short_tokens, None),
         (long_prompt,  "long-text",   long_tokens,  None),
-        (SHORT_PROMPT, "short-image", short_tokens,  test_image),
     ]
+    if not args.text_only:
+        prompts.append((SHORT_PROMPT, "short-image", short_tokens, test_image))
 
     # ── Run benchmarks ──────────────────────────────────────────────────────
     all_results: List[BenchResult] = []
@@ -435,6 +456,7 @@ def main():
                     prompt_text, prompt_type, in_tok,
                     args.max_new_tokens, args.warmup, args.runs,
                     image=img,
+                    use_paged_attention=args.paged_attention,
                 )
                 all_results.extend(res)
                 for r in res:

@@ -314,6 +314,7 @@ def bench_model(
     use_pa: bool,
     cache_root: Path,
     mmap_modes: List[bool],
+    pre_warmup_runs: int = 0,
 ) -> List[LoadMemResult]:
     import openvino_genai as ov_genai
 
@@ -379,6 +380,21 @@ def bench_model(
         except Exception:
             pass
         print(f"    ov_load_time = {ov_load_ms:.1f} ms")
+
+        # ── GPU PRE-HEAT: extra generate calls to ramp iGPU frequency ─────
+        # iGPU (Arc) can sit at reduced frequency after an idle period.
+        # Running N short inferences before measurement forces the driver
+        # to ramp to boost frequency before any timed run.
+        if pre_warmup_runs > 0:
+            preheat_target = sorted(prompts.keys())[0]
+            preheat_text = prompts[preheat_target]
+            print(f"  [{mmap_tag}] GPU pre-heat: {pre_warmup_runs} runs @ {preheat_target}tok to ramp iGPU freq ...", flush=True)
+            t_heat = time.perf_counter()
+            for hi in range(pre_warmup_runs):
+                _generate(pipe, ptype, preheat_text, gen_cfg)
+            heat_s = time.perf_counter() - t_heat
+            print(f"    pre-heat done in {heat_s:.1f}s ({heat_s/pre_warmup_runs*1000:.0f}ms/call avg)")
+            gc.collect()
 
         # ── INFERENCE ─────────────────────────────────────────────────────
         for target in sorted(prompts.keys()):
@@ -533,6 +549,9 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--pre-warmup-runs", type=int, default=0,
+                        help="Extra generate calls before measurement to ramp iGPU "
+                             "frequency (default 0). Use 10-20 for fresh/idle iGPU.")
     parser.add_argument("--input-lengths", nargs="+", type=int, default=[512, 1024, 2048])
     parser.add_argument("--no-paged-attention", action="store_true")
     parser.add_argument("--cache-root", default="ov_cache_tmp")
@@ -552,7 +571,7 @@ def main() -> None:
     print(f"PagedAttention : {'ON' if use_pa else 'OFF'}")
     print(f"mmap modes     : {['ON' if m else 'OFF' for m in mmap_modes]}")
     print(f"Input lengths  : {args.input_lengths}")
-    print(f"Output tokens  : {args.max_new_tokens}  warmup={args.warmup}  runs={args.runs}")
+    print(f"Output tokens  : {args.max_new_tokens}  warmup={args.warmup}  runs={args.runs}  pre_warmup={args.pre_warmup_runs}")
 
     model_dirs = []
     for d in args.model_dir:
@@ -596,6 +615,7 @@ def main() -> None:
                 mdir, args.device, prompts, raw_tokens,
                 args.max_new_tokens, args.warmup, args.runs,
                 use_pa, cache_root, mmap_modes,
+                pre_warmup_runs=args.pre_warmup_runs,
             )
             all_results.extend(res)
         except Exception as e:

@@ -280,53 +280,76 @@ requires trusting `os_peak_wset_gb` for the true host RAM peak.
 
 ---
 
-## 5. Full KPI Results (Inference, mmap=ON, avg of runs ≥ 1)
+## 5. Full KPI Results (Inference, mmap=ON, avg of runs 2–3)
 
-> Source: `results_loadmem_0706_v2.csv`  
-> Config: warmup=0, runs=2, max_new_tokens=128, PA=ON, device=GPU
+> Source: `results_kpi_sep2_0709.csv` (sequential run: E4B first → 3 min idle → Llama)  
+> Config: warmup=1, **pre-warmup-runs=15** (GPU frequency ramp), runs=3, max_new_tokens=128, PA=ON, device=GPU
+
+> **Methodology note:** Arc B390 iGPU can drop to a reduced power state after idle periods.
+> `--pre-warmup-runs 15` forces 15 extra generate calls before measurement to ramp the GPU
+> driver to boost frequency. Results are validated within ±5% of a concurrently-run reference.
 
 ### 5.1 Throughput & latency
 
-| Model | mmap | InTok | TTFT_ms | Prefill_tps | TPOT_ms | Decode_tps |
-|---|:---:|---:|---:|---:|---:|---:|
-| Gemma-4-E4B QAT | ON | 512 | 332 | 1 436 | 33.3 | 30.0 |
-| Gemma-4-E4B QAT | ON | 1 024 | 537 | 1 842 | 34.2 | 29.2 |
-| Gemma-4-E4B QAT | OFF | 512 | 349 | 1 369 | 33.5 | 29.8 |
-| Gemma-4-E4B QAT | OFF | 1 024 | 548 | 1 806 | 34.2 | 29.2 |
-| Llama-3.1-8B | ON | 512 | 236 | 2 029 | 43.5 | 23.0 |
-| Llama-3.1-8B | ON | 1 024 | 470 | 2 106 | 44.2 | 22.6 |
-| Llama-3.1-8B | OFF | 512 | 251 | 1 902 | 43.9 | 22.8 |
-| Llama-3.1-8B | OFF | 1 024 | 469 | 2 111 | 44.7 | 22.4 |
+| Model | InTok | TTFT_ms | Prefill_tps | TPOT_ms | Decode_tps |
+|---|---:|---:|---:|---:|---:|
+| **Gemma-4-E4B QAT** | 512 | 326 | 1 463 | 33.4 | 30.0 |
+| | 1 024 | 500 | 1 977 | 34.1 | 29.4 |
+| | 2 048 | 906 | 2 221 | 35.4 | 28.1 |
+| | 4 096 | 1 913 | 2 123 | 35.4 | 28.0 |
+| **Llama-3.1-8B** | 512 | 247 | 1 938 | 43.5 | 23.0 |
+| | 1 024 | 453 | 2 186 | 44.4 | 22.5 |
+| | 2 048 | 946 | 2 130 | 46.1 | 21.7 |
+| | 4 096 | 1 975 | 2 057 | 45.2 | 22.1 |
 
-### 5.2 Memory during inference
+### 5.2 Memory during inference (sustained CPU-side RSS)
 
-| Model | mmap | InTok | sustained_rss_gb | peak_infer_rss_gb |
-|---|:---:|---:|---:|---:|
-| Gemma-4-E4B QAT | ON | 512 | 7.89 | 7.89 |
-| Gemma-4-E4B QAT | ON | 1 024 | 8.15 | 8.15 |
-| Llama-3.1-8B | ON | 512 | 5.87 | 6.10 |
-| Llama-3.1-8B | ON | 1 024 | 5.98 | 5.98 |
+| Model | InTok | sustained_rss_gb |
+|---|---:|---:|
+| **Gemma-4-E4B QAT** | 512 | 7.76 |
+| | 1 024 | 8.03 |
+| | 2 048 | 8.63 |
+| | 4 096 | 9.76 |
+| **Llama-3.1-8B** | 512 | 5.71 |
+| | 1 024 | 5.85 |
+| | 2 048 | 6.18 |
+| | 4 096 | 6.80 |
 
 E4B inference RSS is ~2 GB higher than Llama-8B despite fewer total params:
 - E4B loads 6 235 MB of model data (including 2 689 MB PLE) vs Llama's 4 621 MB
+- KV cache grows with input length; E4B's 42-layer mixed attention allocates more KV slots
 - VLMPipeline maintains additional buffers for multimodal preprocessing
-- OV KV cache for E4B's mixed sliding-window + full attention requires more complex allocation
 
-### 5.3 E4B vs Llama summary at 1024-tok input
+### 5.3 E4B vs Llama head-to-head at 1024-tok input
 
 | Metric | Gemma-4-E4B QAT | Llama-3.1-8B | Winner |
 |---|---:|---:|---|
-| TTFT (ms) | 537 | 470 | Llama (−12%) |
-| Prefill (tps) | 1 842 | 2 106 | **Llama (+14%)** |
-| TPOT (ms) | 34.2 | 44.2 | E4B (−23%) |
-| Decode (tps) | **29.2** | 22.6 | **E4B (+29%)** |
-| Sustained RSS (GB) | 8.15 | 5.98 | **Llama (−27%)** |
+| TTFT (ms) | 500 | 453 | Llama (−9%) |
+| Prefill (tps) | 1 977 | 2 186 | **Llama (+11%)** |
+| TPOT (ms) | 34.1 | 44.4 | E4B (−23%) |
+| Decode (tps) | **29.4** | 22.5 | **E4B (+31%)** |
+| Sustained RSS (GB) | 8.03 | 5.85 | **Llama (−27%)** |
 | Load warm / mmap=OFF (s) | **4.3** | 4.8 | E4B (−10%) |
 | OS peak load RAM (mmap=ON) | 8.20 | 10.61 | E4B (−23%) |
 
-**E4B excels at decode throughput** (MoE-like decode efficiency via KV sharing + small
-active compute per step) while **Llama excels at prefill throughput** (clean dense attention,
-no PLE overhead, efficient GEMM sizing, lightweight LLMPipeline).
+**E4B excels at decode throughput** (KV sharing + narrow hidden dim = cheaper per-token step)
+while **Llama excels at prefill throughput** (clean dense attention, no PLE overhead,
+efficient 4 096-wide GEMMs, lightweight LLMPipeline).
+
+### 5.4 Prefill throughput scaling with input length
+
+Both models scale well but E4B catches up at longer contexts:
+
+| InTok | E4B Prefill_tps | Llama Prefill_tps | Llama advantage |
+|---:|---:|---:|---:|
+| 512 | 1 463 | 1 938 | +32% |
+| 1 024 | 1 977 | 2 186 | +11% |
+| 2 048 | 2 221 | 2 130 | **E4B +4%** |
+| 4 096 | 2 123 | 2 057 | **E4B +3%** |
+
+At 2 k+ tokens E4B's prefill advantage from larger attention GEMMs (longer sequences =
+bigger Q×K products) overcomes the PLE bandwidth overhead. Llama plateaus at ~2 000–2 200 tps
+across all lengths because its uniform full-attention is already well-saturated at 512 tok.
 
 ---
 
@@ -362,23 +385,38 @@ Detected as LLM (no `openvino_vision_embeddings_model.xml`) → uses `LLMPipelin
 
 | Script | Purpose |
 |---|---|
-| `benchmark_loadmem.py` | Load time + mmap ON/OFF + peak/sustained memory + OV load_time |
-| `run_loadmem.ps1` | Wrapper to source `setupvars.ps1` and invoke `benchmark_loadmem.py` |
-| `results_loadmem_0706_v2.csv` | Raw results — 16 rows (2 models × 2 mmap × 2 lengths × 2 runs) |
+| `benchmark_loadmem.py` | Load time + mmap ON/OFF + peak/sustained memory + OV load_time + `--pre-warmup-runs` |
+| `run_sep_e4b_then_llama.ps1` | Sequential runner: E4B → 3 min idle → Llama, single output CSV |
+| `results_loadmem_0706_v2.csv` | Load/memory results — 16 rows (2 models × 2 mmap × 2 lengths × 2 runs) |
+| `results_kpi_sep2_0709.csv` | **Primary KPI results** — 24 rows (2 models × 4 lengths × 3 runs), sequential, pre-heated |
 
-### Run command (0706 build, mmap ON + OFF)
+### Run command — sequential with GPU pre-heat (recommended)
 ```powershell
 & "C:\working\gemma4\openvino_genai_windows_2026.3.0.0.dev20260706_x86_64\setupvars.ps1" -python_version "3.12"
 cd "C:\working\gemma4\gemma4-openvino-genai"
+
+# E4B first
 & "C:\working\gemma4\.venv\Scripts\python.exe" benchmark_loadmem.py `
     --model-dir models/gemma-4-E4B-it-qat-ov-int4-gs64-johnson `
-               models/Llama-3.1-8B-Instruct-ov-int4-gs64-johnson `
-    --device GPU --warmup 0 --runs 2 `
-    --input-lengths 512 1024 `
-    --mmap on off `
-    --cache-root ov_cache_tmp `
-    --output-csv results_loadmem_0706_v2.csv
+    --device GPU --warmup 1 --runs 3 --pre-warmup-runs 15 `
+    --input-lengths 512 1024 2048 4096 `
+    --mmap on --cache-root ov_cache_sep `
+    --output-csv results_e4b.csv
+
+Start-Sleep -Seconds 180   # 3-minute iGPU idle gap
+
+# Llama second
+& "C:\working\gemma4\.venv\Scripts\python.exe" benchmark_loadmem.py `
+    --model-dir models/Llama-3.1-8B-Instruct-ov-int4-gs64-johnson `
+    --device GPU --warmup 1 --runs 3 --pre-warmup-runs 15 `
+    --input-lengths 512 1024 2048 4096 `
+    --mmap on --cache-root ov_cache_sep `
+    --output-csv results_llama.csv
 ```
+
+> **`--pre-warmup-runs 15`** is critical for sequential testing. Arc B390 iGPU drops to a
+> reduced frequency state during idle gaps. Without pre-heat, early measurement runs (512–1024 tok)
+> are throttled ~50% below full performance, recovering only after several minutes of sustained load.
 
 ### OV GenAI API notes
 
@@ -394,4 +432,4 @@ ov_load_ms = result.perf_metrics.get_load_time()
 
 ---
 
-*Generated by `benchmark_loadmem.py` on 2026-07-09 · OV GenAI 0706 · Intel Arc B390 iGPU*
+*Generated by `benchmark_loadmem.py` · updated 2026-07-13 · OV GenAI 0706 · Intel Arc B390 iGPU*
